@@ -1,0 +1,7 @@
+{
+  "name": "orion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ORION — high-fidelity historical market trading simulator",
+  "workspaces": ["sim"]
+}
