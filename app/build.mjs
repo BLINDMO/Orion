@@ -1,6 +1,6 @@
 // Bundle the ORION web client (engine + UI) into a single browser module.
 import { build, context } from "esbuild";
-import { cp, mkdir } from "node:fs/promises";
+import { cp, mkdir, writeFile } from "node:fs/promises";
 
 const opts = {
   entryPoints: ["src/main.ts"],
@@ -16,6 +16,9 @@ const opts = {
 await mkdir("public", { recursive: true });
 await cp("index.html", "public/index.html");
 await cp("styles.css", "public/styles.css");
+// Serve as-is on GitHub Pages (no Jekyll processing); also a fallback for any path.
+await writeFile("public/.nojekyll", "");
+await cp("index.html", "public/404.html");
 
 if (process.argv.includes("--serve")) {
   const ctx = await context(opts);
