@@ -79,8 +79,17 @@ export class World {
   readonly equityCurve: { t: Millis; equity: string }[] = [];
   /** Closed-trade records for analytics (§12). */
   readonly closedTrades: ClosedTrade[] = [];
-  /** Realized stats: theta captured/paid, assignments. */
-  optionStats = { thetaPaid: dec(0), assignments: 0, expiredWorthless: 0, exercised: 0 };
+  /** Realized stats: theta captured/paid (signed: <0 paid, >0 collected), assignments, entry IV. */
+  optionStats = {
+    thetaPaid: dec(0),
+    assignments: 0,
+    expiredWorthless: 0,
+    exercised: 0,
+    ivSum: 0,
+    ivCount: 0,
+  };
+  /** Cumulative traded notional, for turnover (§12). */
+  tradedNotional: Dec = dec(0);
 
   private rng: Rng;
   private idSeq = 0;
@@ -307,6 +316,9 @@ export class World {
     // 2) Option orders fill against synthesized quotes at the new clock.
     this.processOptionOrders();
 
+    // 2b) Accrue realized theta on open option positions over the interval (§12).
+    this.accrueOptionTheta(prevNow, newNow);
+
     // 3) Settle expiring options and handle assignment.
     this.settleExpiries();
 
@@ -498,9 +510,10 @@ export class World {
     const key = targetKey(o.target);
     const mult = o.target.kind === "option" && o.target.option ? o.target.option.multiplier : 1;
     const symbol = symbolOf(o.target);
+    const opening = this.isOpeningFill(o, key);
 
     // Buying-power gate at fill time for opening/increasing trades.
-    if (this.isOpeningFill(o, key)) {
+    if (opening) {
       const notional = price.mul(qty).mul(mult);
       const bp = this.buyingPower();
       if (notional.gt(bp.add("0.01"))) {
@@ -514,9 +527,20 @@ export class World {
     const notional = price.mul(qty).mul(mult);
     const fee = this.market.fee(symbol, notional, liquidity);
     const existing = this.portfolio.get(key);
+    const entryOpenedAt = existing?.openedAt ?? at;
     const booked = bookFill(existing, o.target, key, o.side, qty, price, mult, at);
     const realized = this.portfolio.apply(booked, key);
     this.portfolio.cash = this.portfolio.cash.sub(fee);
+    this.tradedNotional = this.tradedNotional.add(notional.abs());
+
+    // Record entry IV for opening option trades (§12 — average IV at entry).
+    if (opening && o.target.kind === "option" && o.target.option) {
+      const q = this.market.optionQuote(o.target.option, this.now);
+      if (q) {
+        this.optionStats.ivSum += q.iv;
+        this.optionStats.ivCount++;
+      }
+    }
 
     // Update order aggregates (VWAP fill price).
     const prevNotional = o.avgFillPrice.mul(o.filledQty);
@@ -540,7 +564,7 @@ export class World {
     };
     this.fills.push(fill);
     if (!realized.isZero()) {
-      this.recordClosedTrade(o.target, realized, at);
+      this.recordClosedTrade(o.target, realized, at, at - entryOpenedAt);
     }
   }
 
@@ -577,7 +601,7 @@ export class World {
       // OTM → expire worthless: close at 0, realizing the remaining premium.
       const booked = bookFill(pos, pos.target, key, pos.qty > 0 ? "sell" : "buy", Math.abs(pos.qty), Dec.ZERO, mult, this.now);
       const realized = this.portfolio.apply(booked, key);
-      this.recordClosedTrade(pos.target, realized, this.now);
+      this.recordClosedTrade(pos.target, realized, this.now, this.now - pos.openedAt);
       this.optionStats.expiredWorthless++;
       return;
     }
@@ -586,7 +610,7 @@ export class World {
       // Cash-settle the intrinsic value.
       const booked = bookFill(pos, pos.target, key, pos.qty > 0 ? "sell" : "buy", Math.abs(pos.qty), dec(intrinsic), mult, this.now);
       const realized = this.portfolio.apply(booked, key);
-      this.recordClosedTrade(pos.target, realized, this.now);
+      this.recordClosedTrade(pos.target, realized, this.now, this.now - pos.openedAt);
       if (pos.qty < 0) this.optionStats.assignments++;
       else this.optionStats.exercised++;
       return;
@@ -622,13 +646,26 @@ export class World {
     this.portfolio.realizedPnl = this.portfolio.realizedPnl.add(booked.realizedDelta);
     if (booked.position) this.portfolio.positions.set(spec.underlying, booked.position);
     else this.portfolio.positions.delete(spec.underlying);
-    if (!booked.realizedDelta.isZero()) this.recordClosedTrade(stockTarget, booked.realizedDelta, this.now);
+    if (!booked.realizedDelta.isZero()) this.recordClosedTrade(stockTarget, booked.realizedDelta, this.now, this.now - pos.openedAt);
 
     if (isLong) this.optionStats.exercised++;
     else this.optionStats.assignments++;
   }
 
   // --- Borrow cost ---------------------------------------------------------
+
+  /** Accrue realized theta: Σ position.theta × qty × mult × dtYears (signed). */
+  private accrueOptionTheta(prevNow: Millis, newNow: Millis): void {
+    const dtYears = (newNow - prevNow) / YEAR_MS;
+    if (dtYears <= 0) return;
+    for (const pos of this.portfolio.positions.values()) {
+      if (pos.target.kind !== "option" || !pos.option) continue;
+      const q = this.market.optionQuote(pos.option, this.now);
+      if (!q) continue;
+      const thetaPnl = q.greeks.theta * pos.qty * pos.multiplier * dtYears;
+      this.optionStats.thetaPaid = this.optionStats.thetaPaid.add(thetaPnl);
+    }
+  }
 
   private accrueBorrow(prevNow: Millis, newNow: Millis): void {
     const dtYears = (newNow - prevNow) / YEAR_MS;
@@ -674,12 +711,15 @@ export class World {
     this.equityCurve.push({ t: this.now, equity: this.equity().toFixed(2) });
   }
 
-  private recordClosedTrade(target: OrderTarget, realized: Dec, at: Millis): void {
+  private recordClosedTrade(target: OrderTarget, realized: Dec, at: Millis, holdMs = 0): void {
+    const symbol = symbolOf(target);
     this.closedTrades.push({
-      symbol: symbolOf(target),
+      symbol,
       kind: target.kind,
+      assetClass: this.universe.get(symbol).assetClass,
       realized: realized.toFixed(2),
       at,
+      holdMs,
     });
   }
 
@@ -708,7 +748,8 @@ export class World {
     this.fills.length = 0;
     this.equityCurve.length = 0;
     this.closedTrades.length = 0;
-    this.optionStats = { thetaPaid: dec(0), assignments: 0, expiredWorthless: 0, exercised: 0 };
+    this.optionStats = { thetaPaid: dec(0), assignments: 0, expiredWorthless: 0, exercised: 0, ivSum: 0, ivCount: 0 };
+    this.tradedNotional = dec(0);
     this.idSeq = 0;
     this.lastSample = -1;
     this.market.setConfig(this.marketCfg());
@@ -719,8 +760,10 @@ export class World {
 export interface ClosedTrade {
   symbol: string;
   kind: "spot" | "option";
+  assetClass: "equity" | "crypto";
   realized: string;
   at: Millis;
+  holdMs: number;
 }
 
 function symbolOf(t: OrderTarget): string {
