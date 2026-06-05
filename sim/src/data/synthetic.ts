@@ -31,29 +31,40 @@ export interface SyntheticSpec {
 }
 
 const YEAR_MIN = 365 * 24 * 60; // crypto: minutes per year (continuous)
+const BARS_PER_YEAR: Record<Resolution, number> = {
+  "1m": 365 * 24 * 60,
+  "1h": 365 * 24,
+  "1d": 365,
+};
 
 function roundTick(p: number, tick: number): number {
   return Math.round(p / tick) * tick;
 }
 
-/** Generate 1-minute bars over a GBM path, honoring the trading calendar. */
-export function generateMinuteBars(spec: SyntheticSpec): Bar[] {
+/**
+ * Generate `count` bars at an arbitrary base resolution over a GBM path,
+ * honoring the trading calendar. The diffusion scales with the resolution so
+ * hourly bars look like hourly bars and minute bars like minute bars.
+ */
+export function generateBars(spec: SyntheticSpec, res: Resolution, count: number): Bar[] {
   const rng = new Rng(spec.seed);
   const cal = getCalendar(spec.calendar);
-  const dt = 1 / YEAR_MIN; // year fraction per minute
+  const dt = 1 / BARS_PER_YEAR[res];
   const drift = (spec.driftAnnual - 0.5 * spec.volAnnual * spec.volAnnual) * dt;
   const diffusion = spec.volAnnual * Math.sqrt(dt);
+  const stepMs = RESOLUTION_MS[res];
+  // baseVolume is per-minute; a coarser bar accumulates proportionally more.
+  const volScale = stepMs / RESOLUTION_MS["1m"];
 
   const bars: Bar[] = [];
   let price = spec.startPrice;
   let t = spec.start;
   let produced = 0;
   let guard = 0;
-  const maxGuard = spec.minutes * 5 + 1000;
+  const maxGuard = count * 5 + 1000;
 
-  while (produced < spec.minutes && guard++ < maxGuard) {
+  while (produced < count && guard++ < maxGuard) {
     if (!cal.isOpen(t)) {
-      // jump to next open for calendars with sessions
       t = cal.nextOpen(t);
       if (!Number.isFinite(t)) break;
       continue;
@@ -61,13 +72,12 @@ export function generateMinuteBars(spec: SyntheticSpec): Bar[] {
     const open = price;
     const shock = Math.exp(drift + diffusion * rng.gaussian());
     const close = open * shock;
-    // intrabar wick: extend beyond open/close by a fraction of the move + noise
     const span = Math.abs(close - open);
     const wickUp = span * rng.range(0.1, 0.9) + open * diffusion * rng.range(0, 0.4);
     const wickDn = span * rng.range(0.1, 0.9) + open * diffusion * rng.range(0, 0.4);
     const high = Math.max(open, close) + wickUp;
     const low = Math.max(spec.tickSize, Math.min(open, close) - wickDn);
-    const vol = Math.round(spec.baseVolume * rng.range(0.5, 1.8) * (1 + 4 * Math.abs(shock - 1)));
+    const vol = Math.round(spec.baseVolume * volScale * rng.range(0.5, 1.8) * (1 + 4 * Math.abs(shock - 1)));
 
     bars.push({
       t,
@@ -78,10 +88,76 @@ export function generateMinuteBars(spec: SyntheticSpec): Bar[] {
       v: vol,
     });
     price = close;
-    t += RESOLUTION_MS["1m"];
+    t += stepMs;
     produced++;
   }
   return bars;
+}
+
+/** Generate 1-minute bars over a GBM path, honoring the trading calendar. */
+export function generateMinuteBars(spec: SyntheticSpec): Bar[] {
+  return generateBars(spec, "1m", spec.minutes);
+}
+
+/**
+ * Refine one closed 1-hour bar into 60 internally-consistent 1-minute bars via a
+ * pinned Brownian bridge. The minutes open at the hour's open, close at the
+ * hour's close, and their aggregate high/low equal the hour's — so the 1m series
+ * aggregates EXACTLY back to the 1h bar (no resolution discontinuity).
+ */
+function refineHourToMinutes(hour: Bar, tick: number, rng: Rng): Bar[] {
+  const N = 60;
+  const cum: number[] = [];
+  let s = 0;
+  for (let i = 0; i < N; i++) { s += rng.gaussian(); cum.push(s); }
+  const endCum = cum[N - 1] || 0;
+  const range = Math.max(hour.h - hour.l, Math.abs(hour.o) * 1e-6, tick);
+
+  let maxAbs = 1e-9;
+  const bridged: number[] = [];
+  for (let i = 0; i < N; i++) {
+    const frac = (i + 1) / N;
+    const b = cum[i]! - frac * endCum; // ~0 at the final step
+    bridged.push(b);
+    if (Math.abs(b) > maxAbs) maxAbs = Math.abs(b);
+  }
+
+  const amp = range * 0.4;
+  const closes: number[] = [];
+  for (let i = 0; i < N; i++) {
+    const frac = (i + 1) / N;
+    const base = hour.o + (hour.c - hour.o) * frac;
+    let p = base + (bridged[i]! / maxAbs) * amp;
+    p = Math.min(hour.h, Math.max(hour.l, p));
+    closes.push(p);
+  }
+  closes[N - 1] = hour.c; // pin exact close
+
+  // Decide where the hour's extremes land so aggregation reproduces them exactly.
+  let maxI = 0, minI = 0;
+  for (let i = 0; i < N; i++) {
+    if (closes[i]! > closes[maxI]!) maxI = i;
+    if (closes[i]! < closes[minI]!) minI = i;
+  }
+
+  const out: Bar[] = [];
+  let prev = hour.o;
+  const v = Math.max(1, Math.round(hour.v / N));
+  for (let i = 0; i < N; i++) {
+    const o = i === 0 ? hour.o : prev;
+    const c = i === N - 1 ? hour.c : closes[i]!;
+    const w = range * 0.06 * rng.range(0, 1);
+    let hi = Math.min(hour.h, Math.max(o, c) + w);
+    let lo = Math.max(hour.l, Math.min(o, c) - w);
+    if (i === maxI) hi = hour.h;
+    if (i === minI) lo = hour.l;
+    out.push({
+      t: hour.t + i * RESOLUTION_MS["1m"],
+      o: roundTick(o, tick), h: roundTick(hi, tick), l: roundTick(lo, tick), c: roundTick(c, tick), v,
+    });
+    prev = c;
+  }
+  return out;
 }
 
 /** Aggregate finer bars up to a coarser resolution by fixed time buckets. */
@@ -112,5 +188,34 @@ export function buildSyntheticInstrument(spec: SyntheticSpec): InstrumentData {
     "1m": new BarSeries("1m", minute),
     "1h": new BarSeries("1h", aggregate(minute, "1h")),
     "1d": new BarSeries("1d", aggregate(minute, "1d")),
+  });
+}
+
+/**
+ * Build a long-horizon instrument economically: generate the full span at HOURLY
+ * resolution (cheap), derive daily bars from it, and refine only the first
+ * `minuteWindowHours` hours down to 1-minute granularity. This gives effectively
+ * unlimited future to trade into without generating millions of minute bars,
+ * while keeping all three resolutions mutually consistent.
+ */
+export function buildLongInstrument(
+  spec: SyntheticSpec,
+  hours: number,
+  minuteWindowHours: number,
+): InstrumentData {
+  const hourBars = generateBars(spec, "1h", hours);
+  const dayBars = aggregate(hourBars, "1d");
+
+  const rng = new Rng((spec.seed ^ 0x5bd1e995) >>> 0);
+  const minute: Bar[] = [];
+  const window = Math.min(minuteWindowHours, hourBars.length);
+  for (let i = 0; i < window; i++) {
+    for (const mb of refineHourToMinutes(hourBars[i]!, spec.tickSize, rng)) minute.push(mb);
+  }
+
+  return new InstrumentData(spec.symbol, {
+    "1m": new BarSeries("1m", minute),
+    "1h": new BarSeries("1h", hourBars),
+    "1d": new BarSeries("1d", dayBars),
   });
 }

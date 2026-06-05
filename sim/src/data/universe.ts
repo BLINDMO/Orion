@@ -8,7 +8,7 @@
 
 import type { AssetClass, Instrument } from "./types.ts";
 import { InstrumentData } from "./series.ts";
-import { buildSyntheticInstrument, type SyntheticSpec } from "./synthetic.ts";
+import { buildLongInstrument, type SyntheticSpec } from "./synthetic.ts";
 
 const cryptoFees = { takerBps: 40, makerBps: 20, perOrder: 0, minFee: 0 };
 const equityFees = { takerBps: 0, makerBps: 0, perOrder: 0, minFee: 0 };
@@ -95,15 +95,23 @@ const SEED_SPECS: Record<string, Partial<SyntheticSpec>> = {
   ORN: { seed: 2003, startPrice: 130, driftAnnual: 0.18, volAnnual: 0.45 },
 };
 
+/** Hours of 1-minute detail generated from `start` (covers history + near future
+ *  at minute granularity; beyond it the chart/marking use hourly/daily bars). */
+const MINUTE_WINDOW_DAYS = 90;
+
 /**
- * Build the bundled seed dataset: `days` of 1-minute data per instrument,
- * starting at `start`. Crypto runs 24/7; equities honor the calendar.
+ * Build the bundled seed dataset spanning `days` per instrument from `start`.
+ * The full span is generated at hourly/daily resolution (cheap, so there is
+ * effectively unlimited future to trade into); only the first
+ * MINUTE_WINDOW_DAYS are refined to 1-minute granularity. Crypto runs 24/7;
+ * equities honor the calendar.
  */
-export function buildSeedData(start: number, days = 30): Map<string, InstrumentData> {
+export function buildSeedData(start: number, days = 540): Map<string, InstrumentData> {
   const out = new Map<string, InstrumentData>();
+  const hours = days * 24;
+  const minuteWindowHours = MINUTE_WINDOW_DAYS * 24;
   for (const inst of INSTRUMENTS) {
     const base = SEED_SPECS[inst.symbol]!;
-    const minutes = inst.calendar === "24x7" ? days * 24 * 60 : days * 24 * 60; // generator skips closed bars
     const spec: SyntheticSpec = {
       symbol: inst.symbol,
       seed: base.seed!,
@@ -111,12 +119,12 @@ export function buildSeedData(start: number, days = 30): Map<string, InstrumentD
       driftAnnual: base.driftAnnual!,
       volAnnual: base.volAnnual!,
       calendar: inst.calendar,
-      minutes,
+      minutes: 0, // unused by buildLongInstrument
       start,
       baseVolume: inst.assetClass === "crypto" ? 50 : 5000,
       tickSize: inst.tickSize,
     };
-    out.set(inst.symbol, buildSyntheticInstrument(spec));
+    out.set(inst.symbol, buildLongInstrument(spec, hours, minuteWindowHours));
   }
   return out;
 }

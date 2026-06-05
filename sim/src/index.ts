@@ -16,8 +16,10 @@ export { BarSeries, InstrumentData, LookaheadError, setLookaheadGuard, lookahead
 export { Universe, universe, INSTRUMENTS, buildSeedData, barsPerYear } from "./data/universe.ts";
 export {
   generateMinuteBars,
+  generateBars,
   aggregate,
   buildSyntheticInstrument,
+  buildLongInstrument,
   type SyntheticSpec,
 } from "./data/synthetic.ts";
 

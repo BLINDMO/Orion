@@ -132,6 +132,17 @@ export class BarSeries {
   rawAll(): readonly Bar[] {
     return this.bars;
   }
+
+  /** Merge live candles in-place. Newer bars are appended; a bar at the current
+   *  last open replaces it (so a still-forming candle updates as ticks arrive). */
+  appendLive(newBars: readonly Bar[]): void {
+    const incoming = [...newBars].sort((a, b) => a.t - b.t);
+    for (const b of incoming) {
+      const last = this.bars[this.bars.length - 1];
+      if (!last || b.t > last.t) this.bars.push(b);
+      else if (b.t === last.t) this.bars[this.bars.length - 1] = b;
+    }
+  }
 }
 
 /** All resolutions for a single instrument. */
@@ -160,11 +171,27 @@ export class InstrumentData {
   }
 
   /**
-   * Canonical mark price at `now`: the close of the most recent fully-closed bar
-   * at the finest available resolution. Never looks ahead. Undefined if the clock
-   * predates all data.
+   * Canonical mark price at `now`: the close of the FRESHEST fully-closed bar
+   * across all available resolutions. Using the freshest (largest open-time) bar
+   * means marking stays correct even past the end of the fine-grained 1m window —
+   * it transparently falls through to the hourly/daily series. Never looks ahead.
+   * Undefined if the clock predates all data.
    */
   markPrice(now: Millis): number | undefined {
-    return this.finest().lastClosed(now)?.c;
+    let best: Bar | undefined;
+    for (const res of ["1m", "1h", "1d"] as Resolution[]) {
+      const s = this.series[res];
+      if (!s) continue;
+      const b = s.lastClosed(now);
+      if (b && (best === undefined || b.t > best.t)) best = b;
+    }
+    return best?.c;
+  }
+
+  /** Merge live candles into a resolution's series, creating it if absent. */
+  appendLive(res: Resolution, bars: readonly Bar[]): void {
+    const s = this.series[res];
+    if (s) s.appendLive(bars);
+    else this.series[res] = new BarSeries(res, bars);
   }
 }

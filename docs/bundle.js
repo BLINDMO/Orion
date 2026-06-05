@@ -338,6 +338,16 @@ var BarSeries = class {
   rawAll() {
     return this.bars;
   }
+  /** Merge live candles in-place. Newer bars are appended; a bar at the current
+   *  last open replaces it (so a still-forming candle updates as ticks arrive). */
+  appendLive(newBars) {
+    const incoming = [...newBars].sort((a, b) => a.t - b.t);
+    for (const b of incoming) {
+      const last = this.bars[this.bars.length - 1];
+      if (!last || b.t > last.t) this.bars.push(b);
+      else if (b.t === last.t) this.bars[this.bars.length - 1] = b;
+    }
+  }
 };
 var InstrumentData = class {
   symbol;
@@ -359,12 +369,27 @@ var InstrumentData = class {
     return this.series["1m"] ?? this.series["1h"] ?? this.get("1d");
   }
   /**
-   * Canonical mark price at `now`: the close of the most recent fully-closed bar
-   * at the finest available resolution. Never looks ahead. Undefined if the clock
-   * predates all data.
+   * Canonical mark price at `now`: the close of the FRESHEST fully-closed bar
+   * across all available resolutions. Using the freshest (largest open-time) bar
+   * means marking stays correct even past the end of the fine-grained 1m window —
+   * it transparently falls through to the hourly/daily series. Never looks ahead.
+   * Undefined if the clock predates all data.
    */
   markPrice(now) {
-    return this.finest().lastClosed(now)?.c;
+    let best;
+    for (const res of ["1m", "1h", "1d"]) {
+      const s = this.series[res];
+      if (!s) continue;
+      const b = s.lastClosed(now);
+      if (b && (best === void 0 || b.t > best.t)) best = b;
+    }
+    return best?.c;
+  }
+  /** Merge live candles into a resolution's series, creating it if absent. */
+  appendLive(res, bars) {
+    const s = this.series[res];
+    if (s) s.appendLive(bars);
+    else this.series[res] = new BarSeries(res, bars);
   }
 };
 
@@ -539,22 +564,29 @@ function getCalendar(id) {
 
 // ../sim/src/data/synthetic.ts
 var YEAR_MIN = 365 * 24 * 60;
+var BARS_PER_YEAR = {
+  "1m": 365 * 24 * 60,
+  "1h": 365 * 24,
+  "1d": 365
+};
 function roundTick(p, tick) {
   return Math.round(p / tick) * tick;
 }
-function generateMinuteBars(spec) {
+function generateBars(spec, res, count) {
   const rng = new Rng(spec.seed);
   const cal = getCalendar(spec.calendar);
-  const dt = 1 / YEAR_MIN;
+  const dt = 1 / BARS_PER_YEAR[res];
   const drift = (spec.driftAnnual - 0.5 * spec.volAnnual * spec.volAnnual) * dt;
   const diffusion = spec.volAnnual * Math.sqrt(dt);
+  const stepMs = RESOLUTION_MS[res];
+  const volScale = stepMs / RESOLUTION_MS["1m"];
   const bars = [];
   let price = spec.startPrice;
   let t = spec.start;
   let produced = 0;
   let guard = 0;
-  const maxGuard = spec.minutes * 5 + 1e3;
-  while (produced < spec.minutes && guard++ < maxGuard) {
+  const maxGuard = count * 5 + 1e3;
+  while (produced < count && guard++ < maxGuard) {
     if (!cal.isOpen(t)) {
       t = cal.nextOpen(t);
       if (!Number.isFinite(t)) break;
@@ -568,7 +600,7 @@ function generateMinuteBars(spec) {
     const wickDn = span * rng.range(0.1, 0.9) + open * diffusion * rng.range(0, 0.4);
     const high = Math.max(open, close) + wickUp;
     const low = Math.max(spec.tickSize, Math.min(open, close) - wickDn);
-    const vol = Math.round(spec.baseVolume * rng.range(0.5, 1.8) * (1 + 4 * Math.abs(shock - 1)));
+    const vol = Math.round(spec.baseVolume * volScale * rng.range(0.5, 1.8) * (1 + 4 * Math.abs(shock - 1)));
     bars.push({
       t,
       o: roundTick(open, spec.tickSize),
@@ -578,10 +610,66 @@ function generateMinuteBars(spec) {
       v: vol
     });
     price = close;
-    t += RESOLUTION_MS["1m"];
+    t += stepMs;
     produced++;
   }
   return bars;
+}
+function refineHourToMinutes(hour, tick, rng) {
+  const N = 60;
+  const cum = [];
+  let s = 0;
+  for (let i = 0; i < N; i++) {
+    s += rng.gaussian();
+    cum.push(s);
+  }
+  const endCum = cum[N - 1] || 0;
+  const range = Math.max(hour.h - hour.l, Math.abs(hour.o) * 1e-6, tick);
+  let maxAbs = 1e-9;
+  const bridged = [];
+  for (let i = 0; i < N; i++) {
+    const frac = (i + 1) / N;
+    const b = cum[i] - frac * endCum;
+    bridged.push(b);
+    if (Math.abs(b) > maxAbs) maxAbs = Math.abs(b);
+  }
+  const amp = range * 0.4;
+  const closes2 = [];
+  for (let i = 0; i < N; i++) {
+    const frac = (i + 1) / N;
+    const base = hour.o + (hour.c - hour.o) * frac;
+    let p = base + bridged[i] / maxAbs * amp;
+    p = Math.min(hour.h, Math.max(hour.l, p));
+    closes2.push(p);
+  }
+  closes2[N - 1] = hour.c;
+  let maxI = 0, minI = 0;
+  for (let i = 0; i < N; i++) {
+    if (closes2[i] > closes2[maxI]) maxI = i;
+    if (closes2[i] < closes2[minI]) minI = i;
+  }
+  const out = [];
+  let prev = hour.o;
+  const v = Math.max(1, Math.round(hour.v / N));
+  for (let i = 0; i < N; i++) {
+    const o = i === 0 ? hour.o : prev;
+    const c = i === N - 1 ? hour.c : closes2[i];
+    const w = range * 0.06 * rng.range(0, 1);
+    let hi = Math.min(hour.h, Math.max(o, c) + w);
+    let lo = Math.max(hour.l, Math.min(o, c) - w);
+    if (i === maxI) hi = hour.h;
+    if (i === minI) lo = hour.l;
+    out.push({
+      t: hour.t + i * RESOLUTION_MS["1m"],
+      o: roundTick(o, tick),
+      h: roundTick(hi, tick),
+      l: roundTick(lo, tick),
+      c: roundTick(c, tick),
+      v
+    });
+    prev = c;
+  }
+  return out;
 }
 function aggregate(bars, target) {
   const bucket = RESOLUTION_MS[target];
@@ -602,12 +690,19 @@ function aggregate(bars, target) {
   if (cur) out.push({ ...cur });
   return out;
 }
-function buildSyntheticInstrument(spec) {
-  const minute = generateMinuteBars(spec);
+function buildLongInstrument(spec, hours, minuteWindowHours) {
+  const hourBars = generateBars(spec, "1h", hours);
+  const dayBars = aggregate(hourBars, "1d");
+  const rng = new Rng((spec.seed ^ 1540483477) >>> 0);
+  const minute = [];
+  const window2 = Math.min(minuteWindowHours, hourBars.length);
+  for (let i = 0; i < window2; i++) {
+    for (const mb of refineHourToMinutes(hourBars[i], spec.tickSize, rng)) minute.push(mb);
+  }
   return new InstrumentData(spec.symbol, {
     "1m": new BarSeries("1m", minute),
-    "1h": new BarSeries("1h", aggregate(minute, "1h")),
-    "1d": new BarSeries("1d", aggregate(minute, "1d"))
+    "1h": new BarSeries("1h", hourBars),
+    "1d": new BarSeries("1d", dayBars)
   });
 }
 
@@ -687,11 +782,13 @@ var SEED_SPECS = {
   NOVA: { seed: 2002, startPrice: 420, driftAnnual: 0.12, volAnnual: 0.35 },
   ORN: { seed: 2003, startPrice: 130, driftAnnual: 0.18, volAnnual: 0.45 }
 };
-function buildSeedData(start, days = 30) {
+var MINUTE_WINDOW_DAYS = 90;
+function buildSeedData(start, days = 540) {
   const out = /* @__PURE__ */ new Map();
+  const hours = days * 24;
+  const minuteWindowHours = MINUTE_WINDOW_DAYS * 24;
   for (const inst2 of INSTRUMENTS) {
     const base = SEED_SPECS[inst2.symbol];
-    const minutes = inst2.calendar === "24x7" ? days * 24 * 60 : days * 24 * 60;
     const spec = {
       symbol: inst2.symbol,
       seed: base.seed,
@@ -699,12 +796,13 @@ function buildSeedData(start, days = 30) {
       driftAnnual: base.driftAnnual,
       volAnnual: base.volAnnual,
       calendar: inst2.calendar,
-      minutes,
+      minutes: 0,
+      // unused by buildLongInstrument
       start,
       baseVolume: inst2.assetClass === "crypto" ? 50 : 5e3,
       tickSize: inst2.tickSize
     };
-    out.set(inst2.symbol, buildSyntheticInstrument(spec));
+    out.set(inst2.symbol, buildLongInstrument(spec, hours, minuteWindowHours));
   }
   return out;
 }
@@ -2824,13 +2922,71 @@ var LearningProgress = class _LearningProgress {
     return { results: this.results };
   }
 };
-function getCurriculum(world) {
-  return world.settings.helpEnabled ? CURRICULUM : null;
+
+// src/live.ts
+var LIVE_SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD"];
+var CB_GRAN = { "1m": 60, "1h": 3600, "1d": 86400 };
+var KR_INTERVAL = { "1m": 1, "1h": 60, "1d": 1440 };
+var KRAKEN_PAIR = { "BTC-USD": "XBTUSD", "ETH-USD": "ETHUSD", "SOL-USD": "SOLUSD" };
+async function fromCoinbase(symbol, res) {
+  const url = `https://api.exchange.coinbase.com/products/${symbol}/candles?granularity=${CB_GRAN[res]}`;
+  const r = await fetch(url, { signal: AbortSignal.timeout(8e3) });
+  if (!r.ok) throw new Error(`CB ${r.status}`);
+  const rows = await r.json();
+  const out = rows.map(([t, l, h, o, c, v]) => ({ t: t * 1e3, o, h, l, c, v: Math.max(0, v) }));
+  out.sort((a, b) => a.t - b.t);
+  if (!out.length) throw new Error("empty CB");
+  return out;
+}
+async function fromKraken(symbol, res) {
+  const pair = KRAKEN_PAIR[symbol] ?? symbol;
+  const r = await fetch(`https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=${KR_INTERVAL[res]}`, {
+    signal: AbortSignal.timeout(8e3)
+  });
+  if (!r.ok) throw new Error(`KR ${r.status}`);
+  const json = await r.json();
+  if (json.error?.length) throw new Error(json.error[0]);
+  const key = Object.keys(json.result).find((k) => k !== "last");
+  const rows = json.result[key];
+  const out = rows.map((x) => ({ t: Number(x[0]) * 1e3, o: +x[1], h: +x[2], l: +x[3], c: +x[4], v: Math.max(0, +x[6]) }));
+  out.sort((a, b) => a.t - b.t);
+  if (!out.length) throw new Error("empty KR");
+  return out;
+}
+async function fetchCandles(symbol, res) {
+  try {
+    return await fromCoinbase(symbol, res);
+  } catch {
+    return fromKraken(symbol, res);
+  }
 }
 
 // src/store.ts
-var KEY = "orion.session.v3";
-var DAYS = 60;
+var PROFILES_KEY = "orion.profiles";
+function makeId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+function loadPL() {
+  try {
+    const raw = localStorage.getItem(PROFILES_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+  }
+  const id = makeId();
+  const pl = { active: id, list: [{ id, name: "Default", createdAt: Date.now() }] };
+  try {
+    localStorage.setItem(PROFILES_KEY, JSON.stringify(pl));
+  } catch {
+  }
+  return pl;
+}
+function savePL(pl) {
+  try {
+    localStorage.setItem(PROFILES_KEY, JSON.stringify(pl));
+  } catch {
+  }
+}
+var DAYS = 540;
 var HISTORY_DAYS = 25;
 var START = (() => {
   const d = /* @__PURE__ */ new Date();
@@ -2840,16 +2996,27 @@ var Store = class {
   world;
   actions = [];
   progress = new LearningProgress();
-  ui = { symbol: "BTC-USD", theme: "dark", onboarded: false };
+  // Live is OFF by default — the app opens in deterministic practice mode.
+  ui = { symbol: "BTC-USD", theme: "dark", onboarded: false, livePref: false };
   settings;
+  profileId;
+  live = false;
+  onLiveTick = null;
+  histWorld = null;
+  liveTimer = null;
   constructor() {
+    const pl = loadPL();
+    this.profileId = pl.active;
     const saved = this.load();
-    this.settings = saved?.settings ?? { startingCash: 25e3 };
+    this.settings = saved?.settings ?? { startingCash: 1e3 };
     if (saved) {
-      this.ui = saved.ui;
+      this.ui = { livePref: false, ...saved.ui };
       this.progress = LearningProgress.fromJSON(saved.progress);
     }
     this.build(saved);
+  }
+  get key() {
+    return `orion.session.v4.${this.profileId}`;
   }
   build(saved) {
     const data = buildSeedData(saved?.start ?? START, saved?.days ?? DAYS);
@@ -2899,10 +3066,10 @@ var Store = class {
       this.save();
     }
   }
-  // Public mutators (record + persist) -------------------------------------
+  // ── Public mutators ───────────────────────────────────────────────────────
   submit(req) {
     const r = this.world.submit(req);
-    if (r.ok) {
+    if (r.ok && !this.live) {
       this.actions.push({ k: "submit", req });
       this.save();
     }
@@ -2910,12 +3077,12 @@ var Store = class {
   }
   cancel(id) {
     const ok = this.world.cancel(id);
-    if (ok) this.record({ k: "cancel", id });
+    if (ok && !this.live) this.record({ k: "cancel", id });
     return ok;
   }
   advanceTo(to) {
     this.world.advanceTo(to, { stepRes: to - this.world.now > 2 * 864e5 ? "1h" : "1m" });
-    this.record({ k: "advance", to });
+    if (!this.live) this.record({ k: "advance", to });
   }
   deposit(amt) {
     this.world.deposit(amt);
@@ -2931,18 +3098,71 @@ var Store = class {
     this.record({ k: "settings", patch });
   }
   reset(startingCash) {
+    this.disableLive();
     this.world.reset(startingCash !== void 0 ? { startingCash } : void 0);
     this.actions = [];
     this.record({ k: "reset", startingCash });
   }
-  /** Record an advance the UI already applied to the world (animated scrubbing). */
   noteAdvance(to) {
-    this.record({ k: "advance", to });
+    if (!this.live) this.record({ k: "advance", to });
   }
   record(a) {
+    if (this.live) return;
     this.actions.push(a);
     this.save();
   }
+  // ── Live mode ─────────────────────────────────────────────────────────────
+  // Build a fresh live world anchored to real current time — always works
+  // regardless of where the practice clock is positioned.
+  async enableLive() {
+    if (this.live) return;
+    const now = Date.now();
+    const liveSeedStart = now - HISTORY_DAYS * 24 * 36e5;
+    const liveData = buildSeedData(liveSeedStart, DAYS);
+    await Promise.allSettled(
+      LIVE_SYMBOLS.map(async (sym2) => {
+        try {
+          const bars = await fetchCandles(sym2, "1h");
+          if (bars.length) liveData.get(sym2)?.appendLive("1h", bars);
+        } catch {
+        }
+      })
+    );
+    this.histWorld = this.world;
+    this.world = new World({ universe, data: liveData, startNow: now, settings: this.settings });
+    this.world.setMode("live");
+    this.live = true;
+    this.liveTimer = setInterval(() => {
+      void this.pollLive();
+    }, 3e4);
+  }
+  disableLive() {
+    if (!this.live) return;
+    if (this.liveTimer) {
+      clearInterval(this.liveTimer);
+      this.liveTimer = null;
+    }
+    if (this.histWorld) {
+      this.world = this.histWorld;
+      this.histWorld = null;
+    }
+    this.live = false;
+  }
+  async pollLive() {
+    if (!this.live) return;
+    await Promise.allSettled(
+      LIVE_SYMBOLS.map(async (sym2) => {
+        try {
+          const bars = await fetchCandles(sym2, "1h");
+          if (bars.length) this.world.data.get(sym2)?.appendLive("1h", bars);
+        } catch {
+        }
+      })
+    );
+    this.world.advanceTo(Date.now(), { stepRes: "1h" });
+    this.onLiveTick?.();
+  }
+  // ── Persistence ───────────────────────────────────────────────────────────
   save() {
     const p = {
       start: START,
@@ -2953,7 +3173,7 @@ var Store = class {
       progress: this.progress.toJSON()
     };
     try {
-      localStorage.setItem(KEY, JSON.stringify(p));
+      localStorage.setItem(this.key, JSON.stringify(p));
     } catch {
     }
   }
@@ -2962,10 +3182,55 @@ var Store = class {
   }
   load() {
     try {
-      const raw = localStorage.getItem(KEY);
+      const raw = localStorage.getItem(this.key);
       return raw ? JSON.parse(raw) : null;
     } catch {
       return null;
+    }
+  }
+  // ── Profile management ────────────────────────────────────────────────────
+  getProfileName() {
+    return loadPL().list.find((p) => p.id === this.profileId)?.name ?? "Profile";
+  }
+  static listProfiles() {
+    return loadPL().list;
+  }
+  static activeProfileId() {
+    return loadPL().active;
+  }
+  static createProfile(name) {
+    const pl = loadPL();
+    const id = makeId();
+    pl.list.push({ id, name: name.trim() || "Profile", createdAt: Date.now() });
+    pl.active = id;
+    savePL(pl);
+    return id;
+  }
+  static switchProfile(id) {
+    const pl = loadPL();
+    if (pl.list.find((p) => p.id === id)) {
+      pl.active = id;
+      savePL(pl);
+    }
+  }
+  static deleteProfile(id) {
+    const pl = loadPL();
+    if (pl.list.length <= 1) return false;
+    pl.list = pl.list.filter((p) => p.id !== id);
+    if (pl.active === id) pl.active = pl.list[0].id;
+    savePL(pl);
+    try {
+      localStorage.removeItem(`orion.session.v4.${id}`);
+    } catch {
+    }
+    return true;
+  }
+  static renameProfile(id, name) {
+    const pl = loadPL();
+    const p = pl.list.find((x) => x.id === id);
+    if (p) {
+      p.name = name.trim() || p.name;
+      savePL(pl);
     }
   }
 };
@@ -3447,21 +3712,44 @@ var chart;
 var state = {
   screen: "trade",
   tf: "1h",
-  form: { side: "buy", type: "market", qty: "", limit: "", stop: "", trail: "" },
+  form: {
+    side: "buy",
+    type: "market",
+    qty: "",
+    limit: "",
+    stop: "",
+    trail: "",
+    option: null
+  },
   optExpiryIdx: 0,
-  drawerTab: "trade",
-  drawerOpen: false,
-  scrubbing: false,
-  learnModule: null
+  learnModule: null,
+  scrubbing: false
 };
 var ind = { sma: true, ema: true, bb: true, vwap: false };
 var W = () => store.world;
 var sym = () => store.ui.symbol;
 var inst = () => W().universe.get(sym());
-function visibleBars() {
-  const id = W().data.get(sym());
-  const res = id.has(state.tf) ? state.tf : "1h";
-  return id.get(res).visible(W().now).slice();
+var CHART_MAX_BARS = 1500;
+function effectiveRes(id) {
+  const want = id.has(state.tf) ? state.tf : "1h";
+  if (want === "1m") {
+    const last = id.get("1m").lastClosed(W().now);
+    if (!last || W().now - last.t > 3 * 36e5) return "1h";
+  }
+  return want;
+}
+function visibleBars(s = sym()) {
+  const id = W().data.get(s);
+  if (!id) return [];
+  const all = id.get(effectiveRes(id)).visible(W().now);
+  return all.length > CHART_MAX_BARS ? all.slice(all.length - CHART_MAX_BARS) : all.slice();
+}
+function lastAndChange(s) {
+  const bars = visibleBars(s);
+  if (!bars.length) return { last: null, chg: 0 };
+  const last = bars[bars.length - 1];
+  const prev = bars.length > 1 ? bars[bars.length - 2].c : last.o;
+  return { last: last.c, chg: prev ? (last.c - prev) / prev : 0 };
 }
 function boot() {
   document.documentElement.setAttribute("data-theme", store.ui.theme);
@@ -3470,6 +3758,23 @@ function boot() {
     return;
   }
   renderShell();
+  maybeAutoLive();
+}
+function maybeAutoLive() {
+  if (store.ui.livePref !== true) return;
+  void store.enableLive().then(() => {
+    if (store.live) {
+      store.onLiveTick = onLiveTick;
+      refresh();
+      toast("Live prices active", "gain");
+    }
+  }).catch(() => {
+  });
+}
+function onLiveTick() {
+  chart?.setData(visibleBars());
+  updateHeader();
+  renderTicker();
 }
 function renderSplash() {
   app.innerHTML = `
@@ -3479,125 +3784,196 @@ function renderSplash() {
         <h1>ORION</h1>
         <div class="splash-sub">Real charts. Your clock. An unknown future.</div>
         <button class="cta" id="begin">Enter ORION</button>
-        <div class="legal-mini">
-          Uses historical and/or delayed market data for practice trading.<br>
-          Not a brokerage. Not financial advice.
-        </div>
+        <div class="legal-mini">Uses historical and/or delayed market data for practice trading.<br>Not a brokerage. Not financial advice.</div>
       </div>
     </div>`;
   document.getElementById("begin").onclick = () => {
     store.ui.onboarded = true;
     store.saveUi();
     renderShell();
+    maybeAutoLive();
   };
 }
 function renderShell() {
   app.innerHTML = `
-    <div class="topbar">
-      <div class="topbar-brand">${brandMark()}</div>
-      <div class="topbar-syms" id="topbarSyms"></div>
-      <div class="topbar-price" id="topbarPrice"></div>
-      <div class="topbar-acct" id="topbarAcct"></div>
-    </div>
+    <header class="topbar">
+      <div class="tb-brand">${brandMark()}</div>
+      <div class="tb-acct" id="tbAcct"></div>
+      <button class="profile-btn" id="profileBtn" aria-label="Profile">
+        <span class="profile-avatar" id="profileAvatar">${initial()}</span>
+      </button>
+    </header>
+
+    <div class="ticker" id="ticker"></div>
+
     <div class="workspace">
       <nav class="sidebar" id="sidebar"></nav>
-      <main class="content">
-        <div class="trade-view">
-          <div class="chart-area">
-            <div class="chart-toolbar" id="chartToolbar"></div>
-            <div class="quickbar">
-              <div class="qb-funds">
-                <span class="qb-k">Available</span>
-                <span class="qb-v num" id="qbBp">\u2014</span>
-              </div>
-              <div class="qb-funds qb-eq">
-                <span class="qb-k">Equity</span>
-                <span class="qb-v num" id="qbEq">\u2014</span>
-              </div>
-              <div class="qb-actions">
-                <button class="qb-btn buy" id="qbBuy">Buy</button>
-                <button class="qb-btn sell" id="qbSell">Sell</button>
-              </div>
-            </div>
-            <div class="chart-wrap"><canvas id="chart"></canvas></div>
-            <div class="timebar">
-              <span class="time-label" id="timeLabel"></span>
-              <span class="mode-pill" id="modePill"></span>
-              <button class="adv-btn" data-adv="h">+1H</button>
-              <button class="adv-btn" data-adv="d">+1D</button>
-              <button class="adv-btn" data-adv="m">+30D</button>
-            </div>
-          </div>
-          <aside class="drawer" id="drawer">
-            <div class="drawer-header">
-              <div class="drawer-tabs" id="drawerTabs"></div>
-              <button class="drawer-close" id="drawerClose">\u2715</button>
-            </div>
-            <div class="drawer-body" id="drawerBody"></div>
-          </aside>
-        </div>
-        <div id="overlay"></div>
+      <main class="content" id="content">
+        ${tradeViewHTML()}
+        <div class="screen-overlay" id="overlay"></div>
       </main>
     </div>
+
+    <nav class="bottom-nav" id="bottomNav"></nav>
+
+    <div class="sheet-backdrop" id="sheetBackdrop"></div>
+    <section class="sheet ticket-sheet" id="ticketSheet" aria-hidden="true">
+      <div class="sheet-grip"></div>
+      <div class="sheet-head">
+        <span class="sheet-title" id="ticketTitle">Order</span>
+        <button class="icon-btn" id="ticketClose">\u2715</button>
+      </div>
+      <div class="sheet-body" id="ticketBody"></div>
+    </section>
+
+    <section class="sheet scan-sheet" id="scanSheet" aria-hidden="true">
+      <div class="sheet-grip"></div>
+      <div class="sheet-head">
+        <span class="sheet-title">\u25C8 Terminal Scan</span>
+        <button class="icon-btn" id="scanClose">\u2715</button>
+      </div>
+      <div class="sheet-body" id="scanBody"></div>
+    </section>
+
+    <section class="sheet profile-sheet" id="profileSheet" aria-hidden="true">
+      <div class="sheet-grip"></div>
+      <div class="sheet-head">
+        <span class="sheet-title">Profiles</span>
+        <button class="icon-btn" id="profileClose">\u2715</button>
+      </div>
+      <div class="sheet-body" id="profileBody"></div>
+    </section>
+
     <div class="toast" id="toast"></div>`;
   chart = new Chart(document.getElementById("chart"));
   chart.setData(visibleBars(), { resetView: true });
   applyIndicators();
-  renderSidebar();
-  renderSymbolTabs();
+  renderNav();
+  renderTicker();
   renderChartToolbar();
-  renderDrawerTabs();
-  renderDrawerBody();
   wireTime();
-  wireDrawerClose();
-  document.getElementById("qbBuy").onclick = () => openTicket("buy");
-  document.getElementById("qbSell").onclick = () => openTicket("sell");
+  document.getElementById("qbBuy").onclick = () => openSpotTicket("buy");
+  document.getElementById("qbSell").onclick = () => openSpotTicket("sell");
+  document.getElementById("ticketClose").onclick = closeSheets;
+  document.getElementById("scanClose").onclick = closeSheets;
+  document.getElementById("profileClose").onclick = closeSheets;
+  document.getElementById("profileBtn").onclick = openProfile;
+  document.getElementById("sheetBackdrop").onclick = closeSheets;
+  store.onLiveTick = onLiveTick;
   if (state.screen !== "trade") mountScreen(state.screen);
   refresh();
 }
-function renderSidebar() {
-  const sidebar = document.getElementById("sidebar");
-  const showLearn = W().settings.helpEnabled;
-  const items = [
-    ["trade", "Trade", tradeIcon()],
-    ["options", "Options", optionsIcon()],
-    ["stats", "Statistics", statsIcon()]
-  ];
-  if (showLearn) items.push(["learn", "Learn", learnIcon()]);
-  sidebar.innerHTML = `
-    ${items.map(([s, tip, icon]) => `
-      <button class="nav-btn ${state.screen === s ? "active" : ""}" data-nav="${s}" aria-label="${tip}">
-        ${icon}
-        <span class="nav-tip">${tip}</span>
-      </button>`).join("")}
-    <div class="sidebar-sep"></div>
-    <div class="sidebar-spacer"></div>
-    <button class="nav-btn ${state.screen === "settings" ? "active" : ""}" data-nav="settings" aria-label="Settings">
-      ${settingsIcon()}
-      <span class="nav-tip">Settings</span>
-    </button>`;
-  sidebar.querySelectorAll("[data-nav]").forEach((b) => b.onclick = () => navigate(b.dataset.nav));
+function tradeViewHTML() {
+  return `<div class="trade-view">
+    <div class="chart-toolbar" id="chartToolbar"></div>
+    <div class="quickbar">
+      <div class="qb-funds">
+        <span class="qb-k">Cash</span>
+        <span class="qb-v num" id="qbBp">\u2014</span>
+      </div>
+      <div class="qb-funds qb-eq">
+        <span class="qb-k">Equity</span>
+        <span class="qb-v num" id="qbEq">\u2014</span>
+      </div>
+      <div class="qb-actions">
+        <button class="qb-btn buy" id="qbBuy">Buy</button>
+        <button class="qb-btn sell" id="qbSell">Sell</button>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart"></canvas></div>
+    <div class="timebar">
+      <span class="time-label" id="timeLabel"></span>
+      <span class="mode-pill" id="modePill"></span>
+      <button class="adv-btn" data-adv="h">+1H</button>
+      <button class="adv-btn" data-adv="d">+1D</button>
+      <button class="adv-btn" data-adv="m">+30D</button>
+    </div>
+  </div>`;
 }
-function renderSymbolTabs() {
-  const wrap = document.getElementById("topbarSyms");
+function initial() {
+  return (store.getProfileName()[0] ?? "P").toUpperCase();
+}
+function navItems() {
+  return [
+    ["trade", "Chart", iChart],
+    ["book", "Book", iBook],
+    ["options", "Options", iOptions],
+    ["stats", "Stats", iStats],
+    ["settings", "Settings", iSettings]
+  ];
+}
+function renderNav() {
+  const items = navItems();
+  const side = document.getElementById("sidebar");
+  if (side) {
+    side.innerHTML = items.map(([s, tip, icon]) => `
+      <button class="nav-btn ${state.screen === s ? "active" : ""}" data-nav="${s}" aria-label="${tip}">
+        ${icon()}<span class="nav-tip">${tip}</span>
+      </button>`).join("") + `<div class="sidebar-spacer"></div>`;
+    side.querySelectorAll("[data-nav]").forEach((b) => b.onclick = () => navigate(b.dataset.nav));
+  }
+  const bn = document.getElementById("bottomNav");
+  if (bn) {
+    bn.innerHTML = items.map(([s, tip, icon]) => `
+      <button class="bn-btn ${state.screen === s ? "active" : ""}" data-nav="${s}">
+        <span class="bn-icon">${icon()}</span>
+        <span class="bn-label">${tip}</span>
+      </button>`).join("");
+    bn.querySelectorAll("[data-nav]").forEach((b) => b.onclick = () => navigate(b.dataset.nav));
+  }
+}
+function navigate(s) {
+  closeSheets();
+  state.screen = s;
+  if (s === "trade") {
+    document.getElementById("overlay").innerHTML = "";
+    chart?.setData(visibleBars());
+  } else {
+    mountScreen(s);
+  }
+  renderNav();
+  refresh();
+}
+function mountScreen(s) {
+  if (s === "book") renderBookScreen();
+  else if (s === "options") renderOptionsScreen();
+  else if (s === "stats") renderStatsScreen();
+  else if (s === "settings") renderSettingsScreen();
+}
+function closeScreen() {
+  navigate("trade");
+}
+function screenShell(title, body) {
+  return `<div class="screen">
+    <div class="shead">
+      <button class="back" id="backBtn" aria-label="Back">\u2039</button>
+      <h2>${title}</h2>
+    </div>
+    <div class="sbody">${body}</div>
+  </div>`;
+}
+function overlayEl() {
+  return document.getElementById("overlay");
+}
+function renderTicker() {
+  const wrap = document.getElementById("ticker");
   if (!wrap) return;
-  const bars = visibleBars();
-  const last = bars[bars.length - 1];
-  const prev = bars.length > 1 ? bars[bars.length - 2].c : last?.o ?? 0;
-  const chg = last && prev ? (last.c - prev) / prev : 0;
   wrap.innerHTML = W().universe.list().map((i) => {
+    const { last, chg } = lastAndChange(i.symbol);
     const isSel = i.symbol === sym();
-    return `<button class="sym-tab ${isSel ? "active" : ""}" data-sym="${i.symbol}">
-      <span class="sym-name">${i.symbol.replace("-USD", "")}</span>
-      ${isSel && last ? `<span class="sym-chg ${pnlClass(chg)}">${pct(chg, 1)}</span>` : ""}
+    return `<button class="ticker-item ${isSel ? "active" : ""}" data-sym="${i.symbol}">
+      <span class="ti-sym">${i.symbol.replace("-USD", "")}</span>
+      <span class="ti-px num">${last !== null ? priceFmt(last) : "\u2014"}</span>
+      <span class="ti-chg num ${pnlClass(chg)}">${pct(chg, 1)}</span>
     </button>`;
   }).join("");
   wrap.querySelectorAll("[data-sym]").forEach((b) => b.onclick = () => {
     store.ui.symbol = b.dataset.sym;
     store.saveUi();
-    renderSymbolTabs();
+    renderTicker();
     renderChartToolbar();
     chart.setData(visibleBars(), { resetView: true });
+    if (state.screen === "options") renderOptionsScreen();
     refresh();
   });
 }
@@ -3605,7 +3981,7 @@ function renderChartToolbar() {
   const toolbar = document.getElementById("chartToolbar");
   if (!toolbar) return;
   const tfs = ["1m", "1h", "1d"];
-  const inds = [["bb", "BB"], ["sma", "SMA 50"], ["ema", "EMA 20"], ["vwap", "VWAP"]];
+  const inds = [["bb", "BB"], ["sma", "SMA"], ["ema", "EMA"], ["vwap", "VWAP"]];
   toolbar.innerHTML = `
     <div class="toolbar-group">
       ${tfs.map((t) => `<button class="toolbar-btn ${state.tf === t ? "active" : ""}" data-tf="${t}">${t.toUpperCase()}</button>`).join("")}
@@ -3627,71 +4003,96 @@ function renderChartToolbar() {
     renderChartToolbar();
     applyIndicators();
   });
-  document.getElementById("termBtn").onclick = openScanTab;
+  document.getElementById("termBtn").onclick = openScan;
 }
 function applyIndicators() {
   if (!chart) return;
   chart.setConfig({ sma: ind.sma ? [50] : [], ema: ind.ema ? [20] : [], bollinger: ind.bb, vwap: ind.vwap });
 }
-function renderDrawerTabs() {
-  const tabs = document.getElementById("drawerTabs");
-  if (!tabs) return;
-  const list = [
-    { id: "trade", label: "Trade" },
-    { id: "scan", label: "\u25C8 Scan" },
-    { id: "book", label: "Book" }
-  ];
-  tabs.innerHTML = list.map(
-    (t) => `<button class="drawer-tab ${state.drawerTab === t.id ? "active" : ""}" data-tab="${t.id}">${t.label}</button>`
-  ).join("");
-  tabs.querySelectorAll("[data-tab]").forEach((b) => b.onclick = () => {
-    state.drawerTab = b.dataset.tab;
-    renderDrawerTabs();
-    renderDrawerBody();
+function openSheet(id) {
+  document.querySelectorAll(".sheet").forEach((s) => {
+    s.classList.remove("open");
+    s.setAttribute("aria-hidden", "true");
   });
+  const sheet = document.getElementById(id);
+  sheet.classList.add("open");
+  sheet.setAttribute("aria-hidden", "false");
+  document.getElementById("sheetBackdrop").classList.add("show");
 }
-function renderDrawerBody() {
-  const body = document.getElementById("drawerBody");
+function closeSheets() {
+  document.querySelectorAll(".sheet").forEach((s) => {
+    s.classList.remove("open");
+    s.setAttribute("aria-hidden", "true");
+  });
+  document.getElementById("sheetBackdrop").classList.remove("show");
+}
+function openScan() {
+  renderScanBody();
+  openSheet("scanSheet");
+}
+function renderScanBody() {
+  const body = document.getElementById("scanBody");
   if (!body) return;
-  if (state.drawerTab === "trade") {
-    body.innerHTML = ticketHTML();
-    wireTicket();
-    updatePreview();
-  } else if (state.drawerTab === "scan") {
-    body.innerHTML = scanHTML();
-  } else {
-    body.innerHTML = bookHTML();
-    wireBook();
-  }
+  const s = scan(W(), sym(), state.tf);
+  const help = W().settings.helpEnabled;
+  body.innerHTML = `
+    <div class="scan-meta">${sym()} \xB7 ${s.timeframe}</div>
+    <div class="badges">
+      <span class="badge ${s.trend === "up" ? "up" : s.trend === "down" ? "down" : ""}">Trend ${s.trend}</span>
+      <span class="badge">Momentum ${s.momentum}</span>
+      <span class="badge">Vol ${s.volatility}</span>
+    </div>
+    ${s.readings.filter((r) => r.value !== void 0).slice(0, 8).map((r) => `
+      <div class="reading">
+        <span class="muted">${r.indicator}</span>
+        <span class="num">${typeof r.value === "number" ? Math.abs(r.value) > 100 ? compact(r.value) : r.value.toFixed(2) : "\u2014"} <span class="dim">${r.state}</span></span>
+      </div>`).join("")}
+    ${help ? s.callouts.slice(0, 4).map((c) => `
+      <div class="callout ${c.severity}">
+        <div class="t">${c.title}</div>
+        <div class="d">${c.detail}</div>
+      </div>`).join("") : ""}`;
 }
-function openScanTab() {
-  state.drawerTab = "scan";
-  state.drawerOpen = true;
-  document.getElementById("drawer").classList.add("open");
-  renderDrawerTabs();
-  renderDrawerBody();
-}
-function openTicket(side) {
+function openSpotTicket(side) {
   if (state.screen !== "trade") navigate("trade");
+  state.form.option = null;
   state.form.side = side;
-  state.drawerTab = "trade";
-  state.drawerOpen = true;
-  document.getElementById("drawer").classList.add("open");
-  renderDrawerTabs();
-  renderDrawerBody();
-  const q = document.getElementById("qty");
-  if (q) {
-    q.focus();
-    q.select();
-  }
+  state.form.type = "market";
+  state.form.qty = "";
+  document.getElementById("ticketTitle").textContent = `${sym().replace("-USD", "")} Order`;
+  renderTicketBody();
+  openSheet("ticketSheet");
+  focusQty();
 }
-function wireDrawerClose() {
-  document.getElementById("drawerClose").onclick = () => {
-    state.drawerOpen = false;
-    document.getElementById("drawer").classList.remove("open");
-  };
+function openOptionTicket(q) {
+  const mid = (q.bid + q.ask) / 2;
+  state.form.option = { spec: q.spec, bid: q.bid, ask: q.ask, mid };
+  state.form.side = "buy";
+  state.form.type = "market";
+  state.form.qty = "1";
+  const label = `${q.spec.underlying.replace("-USD", "")} ${priceFmt(q.spec.strike)}${q.spec.right[0].toUpperCase()}`;
+  document.getElementById("ticketTitle").textContent = label;
+  renderTicketBody();
+  openSheet("ticketSheet");
+  focusQty();
 }
-function ticketHTML() {
+function focusQty() {
+  setTimeout(() => {
+    const q = document.getElementById("qty");
+    if (q) {
+      q.focus();
+      q.select();
+    }
+  }, 60);
+}
+function renderTicketBody() {
+  const body = document.getElementById("ticketBody");
+  if (!body) return;
+  body.innerHTML = state.form.option ? optionTicketHTML() : spotTicketHTML();
+  wireTicket();
+  updatePreview();
+}
+function spotTicketHTML() {
   const i = inst();
   return `<div class="ticket">
     <div class="seg ${state.form.side}" id="sideSeg">
@@ -3720,15 +4121,36 @@ function ticketHTML() {
     <div class="note" id="note"></div>
   </div>`;
 }
+function optionTicketHTML() {
+  const o = state.form.option;
+  const s = o.spec;
+  return `<div class="ticket">
+    <div class="opt-card">
+      <div class="opt-row"><span class="opt-k">Contract</span><span class="opt-v">${s.underlying.replace("-USD", "")} ${priceFmt(s.strike)} ${s.right.toUpperCase()}</span></div>
+      <div class="opt-row"><span class="opt-k">Expiry</span><span class="opt-v num">${dayLabel(s.expiry)}</span></div>
+      <div class="opt-row"><span class="opt-k">Bid / Ask</span><span class="opt-v num">${o.bid.toFixed(2)} / ${o.ask.toFixed(2)}</span></div>
+      <div class="opt-row"><span class="opt-k">Contract size</span><span class="opt-v num">\xD7${s.multiplier}</span></div>
+    </div>
+    <div class="seg ${state.form.side}" id="sideSeg">
+      <button data-side="buy" class="${state.form.side === "buy" ? "on" : ""}">Buy to open</button>
+      <button data-side="sell" class="${state.form.side === "sell" ? "on" : ""}">Sell to open</button>
+    </div>
+    <div class="field"><label>Contracts</label>
+      <input class="input num" id="qty" inputmode="numeric" placeholder="1" value="${state.form.qty}"></div>
+    <div class="preview" id="preview"></div>
+    <button class="submit ${state.form.side}" id="submitBtn"></button>
+    <div class="note" id="note"></div>
+  </div>`;
+}
 function wireTicket() {
   document.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => {
     state.form.side = b.dataset.side;
-    renderDrawerBody();
+    renderTicketBody();
   });
   const typeSel = document.getElementById("typeSel");
   if (typeSel) typeSel.onchange = () => {
     state.form.type = typeSel.value;
-    renderDrawerBody();
+    renderTicketBody();
   };
   for (const id of ["qty", "limit", "stop", "trail"]) {
     const e = document.getElementById(id);
@@ -3737,52 +4159,64 @@ function wireTicket() {
       updatePreview();
     };
   }
-  const btn = document.getElementById("submitBtn");
-  if (btn) btn.onclick = doSubmit;
-}
-function orderReqFromForm() {
-  const qty2 = parseFloat(state.form.qty);
-  const mark = W().market.spotMark(sym(), W().now)?.toNumber();
-  if (!qty2 || qty2 <= 0) return { req: null, estPrice: mark };
-  const req = {
-    target: { kind: "spot", symbol: sym() },
-    side: state.form.side,
-    qty: qty2,
-    type: state.form.type,
-    tif: state.form.type === "market" ? "DAY" : "GTC"
-  };
-  if (["limit", "stop-limit"].includes(state.form.type)) req.limitPrice = parseFloat(state.form.limit) || void 0;
-  if (["stop", "stop-limit"].includes(state.form.type)) req.stopPrice = parseFloat(state.form.stop) || void 0;
-  if (state.form.type === "trailing-stop") req.trailPercent = (parseFloat(state.form.trail) || 5) / 100;
-  return { req, estPrice: mark };
+  document.getElementById("submitBtn").onclick = doSubmit;
 }
 function updatePreview() {
-  const { estPrice } = orderReqFromForm();
-  const qty2 = parseFloat(state.form.qty) || 0;
-  const notional = (estPrice ?? 0) * qty2;
-  const fee = inst().fees.takerBps / 1e4 * notional;
-  const bp = W().buyingPower().toNumber();
-  const after = state.form.side === "buy" ? bp - notional - fee : bp;
   const preview = document.getElementById("preview");
-  if (preview) preview.innerHTML = `
-    <div class="row"><span class="k">Est. price</span><span class="num">${estPrice ? priceFmt(estPrice) : "\u2014"}</span></div>
-    <div class="row"><span class="k">Notional</span><span class="num">${money(notional)}</span></div>
-    <div class="row"><span class="k">Est. fee</span><span class="num">${money(fee)}</span></div>
-    <div class="row"><span class="k">Buying power</span><span class="num">${money(bp)}</span></div>
-    <div class="row"><span class="k">After trade</span><span class="num ${after < 0 ? "loss" : ""}">${money(after)}</span></div>`;
   const btn = document.getElementById("submitBtn");
-  if (btn) {
+  if (!preview || !btn) return;
+  if (state.form.option) {
+    const o = state.form.option;
+    const qty3 = parseFloat(state.form.qty) || 0;
+    const px = state.form.side === "buy" ? o.ask : o.bid;
+    const cost = px * qty3 * o.spec.multiplier;
+    const cash2 = W().portfolio.cash.toNumber();
+    preview.innerHTML = `
+      <div class="row"><span class="k">Est. ${state.form.side === "buy" ? "debit" : "credit"}</span><span class="num">${money(cost)}</span></div>
+      <div class="row"><span class="k">Price / contract</span><span class="num">${px.toFixed(2)} \xD7 ${o.spec.multiplier}</span></div>
+      <div class="row"><span class="k">Cash after</span><span class="num">${money(state.form.side === "buy" ? cash2 - cost : cash2 + cost)}</span></div>`;
     btn.className = `submit ${state.form.side}`;
-    btn.textContent = `${state.form.side === "buy" ? "Buy" : "Sell"} ${qty2 ? qty(qty2) : ""} ${sym().replace("-USD", "")}`.trim();
-    btn.disabled = !qty2;
+    btn.textContent = `${state.form.side === "buy" ? "Buy" : "Sell"} ${qty3 || ""} ${qty3 === 1 ? "contract" : "contracts"}`.replace(/\s+/g, " ").trim();
+    btn.disabled = !qty3;
+    return;
   }
+  const mark = W().market.spotMark(sym(), W().now)?.toNumber();
+  const qty2 = parseFloat(state.form.qty) || 0;
+  const notional = (mark ?? 0) * qty2;
+  const fee = inst().fees.takerBps / 1e4 * notional;
+  const cash = W().portfolio.cash.toNumber();
+  const after = state.form.side === "buy" ? cash - notional - fee : cash + notional - fee;
+  preview.innerHTML = `
+    <div class="row"><span class="k">Est. price</span><span class="num">${mark ? priceFmt(mark) : "\u2014"}</span></div>
+    <div class="row"><span class="k">Notional</span><span class="num">${money(notional)}</span></div>
+    <div class="row"><span class="k">Fee</span><span class="num">${money(fee)}</span></div>
+    <div class="row"><span class="k">Cash after</span><span class="num ${after < 0 ? "loss" : ""}">${money(after)}</span></div>`;
+  btn.className = `submit ${state.form.side}`;
+  btn.textContent = `${state.form.side === "buy" ? "Buy" : "Sell"} ${qty2 ? qty(qty2) : ""} ${sym().replace("-USD", "")}`.trim();
+  btn.disabled = !qty2;
 }
 function doSubmit() {
-  const { req } = orderReqFromForm();
   const note = document.getElementById("note");
-  if (!req) {
+  const qty2 = parseFloat(state.form.qty);
+  if (!qty2 || qty2 <= 0) {
     note.textContent = "Enter a quantity.";
     return;
+  }
+  let req;
+  if (state.form.option) {
+    const s = state.form.option.spec;
+    req = { target: { kind: "option", symbol: s.underlying, option: s }, side: state.form.side, qty: qty2, type: "market", tif: "DAY" };
+  } else {
+    req = {
+      target: { kind: "spot", symbol: sym() },
+      side: state.form.side,
+      qty: qty2,
+      type: state.form.type,
+      tif: state.form.type === "market" ? "DAY" : "GTC"
+    };
+    if (["limit", "stop-limit"].includes(state.form.type)) req.limitPrice = parseFloat(state.form.limit) || void 0;
+    if (["stop", "stop-limit"].includes(state.form.type)) req.stopPrice = parseFloat(state.form.stop) || void 0;
+    if (state.form.type === "trailing-stop") req.trailPercent = (parseFloat(state.form.trail) || 5) / 100;
   }
   const res = store.submit(req);
   if (!res.ok) {
@@ -3791,91 +4225,90 @@ function doSubmit() {
   }
   note.textContent = "";
   state.form.qty = "";
+  closeSheets();
   if (W().mode === "live") toast("Order filled", "gain");
-  else toast(req.type === "market" ? "Market order placed \u2014 fills next bar" : "Order working");
-  renderDrawerBody();
+  else toast(req.type === "market" ? "Order placed \u2014 fills next bar" : "Order working");
   refresh();
+  if (state.screen === "book") renderBookScreen();
+  if (state.screen === "options") renderOptionsScreen();
 }
-function scanHTML() {
-  const s = scan(W(), sym(), state.tf);
-  const help = W().settings.helpEnabled;
-  return `<div class="scan-panel">
-    <div class="scan-head">\u25C8 TERMINAL \u2014 ${sym()} ${s.timeframe}</div>
-    <div class="badges">
-      <span class="badge ${s.trend === "up" ? "up" : s.trend === "down" ? "down" : ""}">Trend: ${s.trend}</span>
-      <span class="badge">Momentum: ${s.momentum}</span>
-      <span class="badge">Vol: ${s.volatility}</span>
-    </div>
-    ${s.readings.filter((r) => r.value !== void 0).slice(0, 7).map((r) => `
-      <div class="reading">
-        <span class="muted">${r.indicator}</span>
-        <span class="num">${typeof r.value === "number" ? Math.abs(r.value) > 100 ? compact(r.value) : r.value.toFixed(2) : "\u2014"} <span class="dim">${r.state}</span></span>
-      </div>`).join("")}
-    ${help ? s.callouts.slice(0, 4).map((c) => `
-        <div class="callout ${c.severity}">
-          <div class="t">${c.title}</div>
-          <div class="d">${c.detail}</div>
-          <div class="lesson">\u21AA Lesson: ${c.lessonId}</div>
-        </div>`).join("") : `<div class="empty mt">Help is off \u2014 pure analysis mode. Enable Help in Settings for plain-English commentary.</div>`}
-  </div>`;
-}
-function bookHTML() {
+function renderBookScreen() {
+  const overlay = overlayEl();
   const resolve = W().markResolver();
-  const pos = [...W().portfolio.positions.values()];
+  const positions = [...W().portfolio.positions.values()];
   const wo = W().workingOrders();
-  const fills = W().fills.slice(-8).reverse();
-  const posHTML = pos.length === 0 ? `<div class="empty">No open positions.</div>` : pos.map((p) => {
+  const fills = W().fills.slice(-12).reverse();
+  const posHTML = positions.length === 0 ? `<div class="empty">No open positions.</div>` : positions.map((p) => {
     const mark = resolve(p)?.toNumber() ?? 0;
-    const upnl = W().portfolio.unrealized(p, resolve).toNumber();
-    const label = p.target.kind === "option" && p.option ? `${p.option.underlying.replace("-USD", "")} ${p.option.strike}${p.option.right[0].toUpperCase()}` : p.target.symbol.replace("-USD", "");
-    return `<div class="li">
-          <div>
-            <div class="sym">${label}</div>
-            <div class="sub-text">${qty(p.qty)} @ ${priceFmt(p.avgCost.toNumber())}</div>
+    const upnl2 = W().portfolio.unrealized(p, resolve).toNumber();
+    const isOpt = p.target.kind === "option" && p.option;
+    const label = isOpt ? `${p.option.underlying.replace("-USD", "")} ${priceFmt(p.option.strike)}${p.option.right[0].toUpperCase()}` : p.target.symbol.replace("-USD", "");
+    const subLabel = isOpt ? `${p.qty > 0 ? "Long" : "Short"} ${Math.abs(p.qty)} \xB7 exp ${dayLabel(p.option.expiry)}` : `${qty(p.qty)} @ ${priceFmt(p.avgCost.toNumber())}`;
+    return `<div class="book-row">
+          <div class="book-info">
+            <div class="book-sym">${label}</div>
+            <div class="sub-text">${subLabel}</div>
           </div>
-          <div class="right">
-            <div class="price">${priceFmt(mark)}</div>
-            <div class="pnl ${pnlClass(upnl)}">${glyph(upnl)} ${money(upnl, { sign: true })}</div>
+          <div class="book-pnl">
+            <div class="book-mark num">${priceFmt(mark)}</div>
+            <div class="pnl num ${pnlClass(upnl2)}">${money(upnl2, { sign: true })}</div>
           </div>
-          <button class="x" data-close="${p.key}">\u2297</button>
+          <button class="action-btn close-btn" data-close="${p.key}">Close</button>
         </div>`;
   }).join("");
-  const ordersHTML = wo.length === 0 ? `<div class="empty">No working orders.</div>` : wo.map((o) => `<div class="li">
-        <div>
-          <div class="sym">${o.side.toUpperCase()} ${qty(o.qty - o.filledQty)} ${(o.target.option?.underlying ?? o.target.symbol).replace("-USD", "")}</div>
+  const ordersHTML = wo.length === 0 ? `<div class="empty">No working orders.</div>` : wo.map((o) => `<div class="book-row">
+        <div class="book-info">
+          <div class="book-sym">${o.side.toUpperCase()} ${qty(o.qty - o.filledQty)} ${(o.target.option?.underlying ?? o.target.symbol).replace("-USD", "")}</div>
           <div class="sub-text">${o.type}${o.limitPrice ? " @ " + priceFmt(o.limitPrice) : ""}${o.stopPrice ? " stop " + priceFmt(o.stopPrice) : ""}</div>
         </div>
-        <button class="x" data-cancel="${o.id}">\u2715</button>
+        <button class="action-btn cancel-btn" data-cancel="${o.id}">Cancel</button>
       </div>`).join("");
-  const blotterHTML = fills.length === 0 ? `<div class="empty">No fills yet.</div>` : fills.map((f) => `<div class="li">
-        <div>
-          <div class="sym">${f.side.toUpperCase()} ${qty(f.qty)} ${(f.target.option?.underlying ?? f.target.symbol).replace("-USD", "")}</div>
-          <div class="sub-text num">${dateLabel(f.at)}</div>
+  const blotterHTML = fills.length === 0 ? `<div class="empty">No fills yet.</div>` : fills.map((f) => `<div class="book-row">
+        <div class="book-info">
+          <div class="book-sym">${f.side.toUpperCase()} ${qty(f.qty)} ${(f.target.option?.underlying ?? f.target.symbol).replace("-USD", "")}</div>
+          <div class="sub-text">${dateLabel(f.at)}</div>
         </div>
-        <div class="right">
-          <div class="price">${priceFmt(f.price.toNumber())}</div>
-          ${!f.realized.isZero() ? `<div class="pnl ${pnlClass(f.realized.toNumber())}">${money(f.realized.toNumber(), { sign: true })}</div>` : `<div class="pnl dim">fee ${money(f.fee.toNumber())}</div>`}
+        <div class="book-pnl">
+          <div class="book-mark num">${priceFmt(f.price.toNumber())}</div>
+          ${!f.realized.isZero() ? `<div class="pnl num ${pnlClass(f.realized.toNumber())}">${money(f.realized.toNumber(), { sign: true })}</div>` : `<div class="pnl num dim">fee ${money(f.fee.toNumber())}</div>`}
         </div>
       </div>`).join("");
-  return `
-    <div class="book-section">
-      <div class="book-head">Positions</div>
-      <div id="positions">${posHTML}</div>
+  const eq = W().equity().toNumber();
+  const cash = W().portfolio.cash.toNumber();
+  const upnl = W().unrealized().toNumber();
+  const totalPnl = eq - W().settings.startingCash;
+  const body = `
+    <div class="port-hero">
+      <div class="ph-k">Total Equity</div>
+      <div class="ph-v num">${money(eq)}</div>
+      <div class="ph-chg num ${pnlClass(totalPnl)}">${glyph(totalPnl)} ${money(totalPnl, { sign: true })} all-time</div>
+    </div>
+    <div class="port-grid">
+      <div class="pg-stat"><div class="pg-k">Cash</div><div class="pg-v num">${money(cash)}</div></div>
+      <div class="pg-stat"><div class="pg-k">Unrealized</div><div class="pg-v num ${pnlClass(upnl)}">${money(upnl, { sign: true })}</div></div>
     </div>
     <div class="book-section">
-      <div class="book-head">Working Orders</div>
-      <div id="orders">${ordersHTML}</div>
+      <div class="book-head">Positions <span class="count-badge">${positions.length}</span></div>
+      ${posHTML}
+    </div>
+    <div class="book-section">
+      <div class="book-head">Working Orders <span class="count-badge">${wo.length}</span></div>
+      ${ordersHTML}
     </div>
     <div class="book-section">
       <div class="book-head">Recent Fills</div>
-      <div id="blotter">${blotterHTML}</div>
+      ${blotterHTML}
     </div>`;
-}
-function wireBook() {
-  document.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => closePosition(b.dataset.close));
-  document.querySelectorAll("[data-cancel]").forEach((b) => b.onclick = () => {
+  overlay.innerHTML = screenShell("Portfolio", body);
+  document.getElementById("backBtn").onclick = closeScreen;
+  overlay.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => {
+    closePosition(b.dataset.close);
+    renderBookScreen();
+  });
+  overlay.querySelectorAll("[data-cancel]").forEach((b) => b.onclick = () => {
     store.cancel(b.dataset.cancel);
     refresh();
+    renderBookScreen();
   });
 }
 function closePosition(key) {
@@ -3883,13 +4316,16 @@ function closePosition(key) {
   if (!p) return;
   const side = p.qty > 0 ? "sell" : "buy";
   store.submit({ target: p.target, side, qty: Math.abs(p.qty), type: "market", tif: "DAY" });
-  if (W().mode === "live") toast("Position closed", "gain");
-  else toast("Close order placed \u2014 fills next bar");
+  toast(W().mode === "live" ? "Position closed" : "Close order placed \u2014 fills next bar", "gain");
   refresh();
 }
 function wireTime() {
   document.querySelectorAll("[data-adv]").forEach((b) => b.onclick = () => {
     if (state.scrubbing) return;
+    if (store.live) {
+      toast("Turn off live mode to scrub time");
+      return;
+    }
     const kind = b.dataset.adv;
     const from = W().now;
     let target = from;
@@ -3906,8 +4342,8 @@ function animateAdvance(from, target) {
   const span = target - from;
   const stepRes = span > 2 * 864e5 ? "1h" : "1m";
   const barMs = stepRes === "1h" ? 36e5 : 6e4;
-  const maxBarsPerFrame = 18;
-  const dur = 750;
+  const maxBarsPerFrame = 24;
+  const dur = 800;
   const t0 = performance.now();
   const ease = (k) => k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
   function frame(now) {
@@ -3916,7 +4352,7 @@ function animateAdvance(from, target) {
     const cap = W().now + maxBarsPerFrame * barMs;
     if (want > cap) want = cap;
     if (want > W().now) W().advanceTo(want, { stepRes });
-    chart.setData(visibleBars());
+    chart?.setData(visibleBars());
     updateHeader();
     if (W().now < target) requestAnimationFrame(frame);
     else finishAdvance(target);
@@ -3929,7 +4365,7 @@ function finishAdvance(target) {
   state.scrubbing = false;
   app.classList.remove("scrubbing");
   setAdvButtons(true);
-  chart.setData(visibleBars());
+  chart?.setData(visibleBars());
   refresh();
   toast(`Advanced to ${dayLabel(W().now)}`);
 }
@@ -3937,93 +4373,81 @@ function setAdvButtons(on) {
   document.querySelectorAll("[data-adv]").forEach((b) => b.disabled = !on);
 }
 function updateHeader() {
-  const priceEl = document.getElementById("topbarPrice");
-  const bars = visibleBars();
-  if (priceEl && bars.length) {
-    const last = bars[bars.length - 1];
-    const prev = bars.length > 1 ? bars[bars.length - 2].c : last.o;
-    const chg = (last.c - prev) / prev;
-    priceEl.innerHTML = `
-      <div class="px num">${priceFmt(last.c)}</div>
-      <div class="chg num ${pnlClass(chg)}">${glyph(chg)} ${pct(chg)}</div>`;
-  }
+  const cash = W().portfolio.cash.toNumber();
   const eq = W().equity().toNumber();
-  const bp = W().buyingPower().toNumber();
   const qbBp = document.getElementById("qbBp");
-  if (qbBp) qbBp.textContent = money(bp);
+  if (qbBp) qbBp.textContent = money(cash);
   const qbEq = document.getElementById("qbEq");
   if (qbEq) qbEq.textContent = money(eq);
-  const acctEl = document.getElementById("topbarAcct");
+  const acctEl = document.getElementById("tbAcct");
   if (acctEl) {
-    const upnl = W().unrealized().toNumber();
     const totalPnl = eq - W().settings.startingCash;
     acctEl.innerHTML = `
+      <div class="acct-item"><span class="k">Cash</span><span class="v num">${money(cash)}</span></div>
       <div class="acct-item"><span class="k">Equity</span><span class="v num">${money(eq)}</span></div>
-      <div class="acct-item"><span class="k">Buying Power</span><span class="v num">${money(bp)}</span></div>
-      <div class="acct-item"><span class="k">Unrealized</span><span class="v num ${pnlClass(upnl)}">${money(upnl, { sign: true })}</span></div>
-      <div class="acct-item"><span class="k">Total P&amp;L</span><span class="v num ${pnlClass(totalPnl)}">${money(totalPnl, { sign: true })}</span></div>`;
+      <div class="acct-item"><span class="k">P&amp;L</span><span class="v num ${pnlClass(totalPnl)}">${money(totalPnl, { sign: true })}</span></div>`;
   }
   const tl = document.getElementById("timeLabel");
   if (tl) tl.textContent = `\u25F7 ${dateLabel(W().now)}`;
   const mp = document.getElementById("modePill");
   if (mp) {
-    mp.textContent = W().mode === "live" ? "LIVE" : "";
-    mp.className = `mode-pill ${W().mode === "live" ? "live" : ""}`;
-    mp.style.display = W().mode === "live" ? "" : "none";
+    if (store.live) {
+      mp.textContent = "\u25CF LIVE";
+      mp.className = "mode-pill live";
+      mp.style.display = "";
+    } else {
+      mp.textContent = "";
+      mp.className = "mode-pill";
+      mp.style.display = "none";
+    }
   }
 }
 function refresh() {
   updateHeader();
-  renderSymbolTabs();
-  if (state.drawerTab === "scan") {
-    const body = document.getElementById("drawerBody");
-    if (body) body.innerHTML = scanHTML();
-  } else if (state.drawerTab === "book") {
-    const body = document.getElementById("drawerBody");
-    if (body) {
-      body.innerHTML = bookHTML();
-      wireBook();
-    }
-  } else {
-    updatePreview();
-  }
+  renderTicker();
+  if (state.screen === "book") renderBookScreen();
 }
-function navigate(s) {
-  state.screen = s;
-  if (s === "trade") {
-    document.getElementById("overlay").innerHTML = "";
-    if (window.innerWidth <= 900) {
-      state.drawerOpen = true;
-      document.getElementById("drawer").classList.add("open");
-    }
-    chart.setData(visibleBars());
-    renderSidebar();
-    refresh();
-    return;
-  }
-  mountScreen(s);
-  renderSidebar();
+function openProfile() {
+  renderProfileBody();
+  openSheet("profileSheet");
 }
-function mountScreen(s) {
-  if (s === "options") renderOptionsScreen();
-  else if (s === "stats") renderStatsScreen();
-  else if (s === "learn") renderLearnScreen();
-  else if (s === "settings") renderSettingsScreen();
-}
-function closeScreen() {
-  navigate("trade");
-}
-function screenShell(title, body) {
-  return `<div class="screen">
-    <div class="shead">
-      <button class="back" id="backBtn">\u2039 Back</button>
-      <h2>${title}</h2>
+function renderProfileBody() {
+  const body = document.getElementById("profileBody");
+  const profiles = Store.listProfiles();
+  const activeId = store.profileId;
+  body.innerHTML = `
+    <div class="pp-list">
+      ${profiles.map((p) => `
+        <div class="pp-item ${p.id === activeId ? "active" : ""}">
+          <span class="pp-avatar">${(p.name[0] ?? "P").toUpperCase()}</span>
+          <div class="pp-info">
+            <div class="pp-name">${p.name}</div>
+            ${p.id === activeId ? `<div class="pp-sub">Active</div>` : ""}
+          </div>
+          ${p.id !== activeId ? `<button class="pp-switch" data-switch="${p.id}">Switch</button>` : ""}
+          ${profiles.length > 1 ? `<button class="pp-del" data-del="${p.id}" aria-label="Delete">\u2715</button>` : ""}
+        </div>`).join("")}
     </div>
-    <div class="sbody">${body}</div>
-  </div>`;
-}
-function overlayEl() {
-  return document.getElementById("overlay");
+    <button class="pp-create" id="ppCreate">+ New Profile</button>`;
+  body.querySelectorAll("[data-switch]").forEach((b) => b.onclick = () => {
+    Store.switchProfile(b.dataset.switch);
+    location.reload();
+  });
+  body.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => {
+    if (confirm("Delete this profile? All its data will be lost.")) {
+      const wasActive = b.dataset.del === activeId;
+      Store.deleteProfile(b.dataset.del);
+      if (wasActive) location.reload();
+      else renderProfileBody();
+    }
+  });
+  document.getElementById("ppCreate").onclick = () => {
+    const name = prompt("Profile name:", "New Profile");
+    if (name) {
+      Store.createProfile(name);
+      location.reload();
+    }
+  };
 }
 function chainParams() {
   const spot = W().market.spotMark(sym(), W().now).toNumber();
@@ -4045,52 +4469,65 @@ function renderOptionsScreen() {
   const chain = buildChain(p, { strikes: 7 });
   state.optExpiryIdx = Math.min(state.optExpiryIdx, chain.expiries.length - 1);
   const exp = chain.expiries[state.optExpiryIdx];
-  const rows = (() => {
-    const strikes = exp.calls.map((c) => c.spec.strike);
-    return strikes.map((k) => {
-      const c = exp.calls.find((x) => x.spec.strike === k);
-      const pu = exp.puts.find((x) => x.spec.strike === k);
-      const isAtm = k === exp.atmStrike;
-      const cItm = p.spot > k, pItm = p.spot < k;
-      return `<tr class="${isAtm ? "atm" : ""}">
-        <td class="${cItm ? "itm" : ""} buyc" data-opt="call:${k}">${c.bid.toFixed(2)} / ${c.ask.toFixed(2)}</td>
-        <td class="${cItm ? "itm" : ""}">${c.greeks.delta.toFixed(2)}</td>
-        <td class="${cItm ? "itm" : ""} dim">${(c.iv * 100).toFixed(0)}%</td>
-        <td class="strike">${priceFmt(k)}</td>
-        <td class="${pItm ? "itm" : ""} dim">${(pu.iv * 100).toFixed(0)}%</td>
-        <td class="${pItm ? "itm" : ""}">${pu.greeks.delta.toFixed(2)}</td>
-        <td class="${pItm ? "itm" : ""} buyc" data-opt="put:${k}">${pu.bid.toFixed(2)} / ${pu.ask.toFixed(2)}</td>
-      </tr>`;
-    }).join("");
-  })();
+  const positions = [...W().portfolio.positions.values()].filter(
+    (pos) => pos.target.kind === "option" && pos.option?.underlying === sym()
+  );
+  const resolve = W().markResolver();
+  const openPositionsHTML = positions.length === 0 ? "" : `
+    <h3 class="section-head">Your Option Positions</h3>
+    ${positions.map((pos) => {
+    const mark = resolve(pos)?.toNumber() ?? 0;
+    const upnl = W().portfolio.unrealized(pos, resolve).toNumber();
+    const opt = pos.option;
+    return `<div class="book-row">
+        <div class="book-info">
+          <div class="book-sym">${opt.underlying.replace("-USD", "")} ${priceFmt(opt.strike)}${opt.right[0].toUpperCase()}</div>
+          <div class="sub-text">${pos.qty > 0 ? "Long" : "Short"} ${Math.abs(pos.qty)} \xB7 exp ${dayLabel(opt.expiry)}</div>
+        </div>
+        <div class="book-pnl">
+          <div class="book-mark num">${priceFmt(mark)}</div>
+          <div class="pnl num ${pnlClass(upnl)}">${money(upnl, { sign: true })}</div>
+        </div>
+        <button class="action-btn close-btn" data-close="${pos.key}">Close</button>
+      </div>`;
+  }).join("")}`;
+  const rows = exp.calls.map((c) => c.spec.strike).map((k) => {
+    const c = exp.calls.find((x) => x.spec.strike === k);
+    const pu = exp.puts.find((x) => x.spec.strike === k);
+    const isAtm = k === exp.atmStrike;
+    const cItm = p.spot > k, pItm = p.spot < k;
+    return `<tr class="${isAtm ? "atm" : ""}">
+      <td class="${cItm ? "itm" : ""} buyc" data-opt="call:${k}">${c.bid.toFixed(2)} / ${c.ask.toFixed(2)}</td>
+      <td class="${cItm ? "itm" : ""}">${c.greeks.delta.toFixed(2)}</td>
+      <td class="strike">${priceFmt(k)}</td>
+      <td class="${pItm ? "itm" : ""}">${pu.greeks.delta.toFixed(2)}</td>
+      <td class="${pItm ? "itm" : ""} buyc" data-opt="put:${k}">${pu.bid.toFixed(2)} / ${pu.ask.toFixed(2)}</td>
+    </tr>`;
+  }).join("");
   const body = `
-    <div class="card">
-      <div class="row-between">
-        <div>
-          <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.06em">${sym()} Spot</div>
-          <div class="num" style="font-size:28px;font-weight:700;margin-top:2px">${priceFmt(p.spot)}</div>
-        </div>
-        <div class="dim" style="font-size:11px;text-align:right">
-          ${inst().assetClass === "equity" ? "American \xB7 physically settled" : "European \xB7 cash settled"}<br>
-          Tap bid/ask to trade 1 contract
-        </div>
+    <div class="card opt-spot">
+      <div>
+        <div class="muted spot-k">${sym()} Spot</div>
+        <div class="num spot-v">${priceFmt(p.spot)}</div>
       </div>
+      <div class="dim spot-note">Tap a bid/ask<br>to open an order</div>
     </div>
+    ${openPositionsHTML}
     <div class="chain-tabs">${chain.expiries.map(
     (e, i) => `<button class="chip ${i === state.optExpiryIdx ? "active" : ""}" data-exp="${i}">${dayLabel(e.expiry)}</button>`
   ).join("")}</div>
     <table class="chain">
-      <thead><tr><th>Call b/a</th><th>\u0394</th><th>IV</th><th>Strike</th><th>IV</th><th>\u0394</th><th>Put b/a</th></tr></thead>
+      <thead><tr><th>Call b/a</th><th>\u0394</th><th>Strike</th><th>\u0394</th><th>Put b/a</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <h3 style="margin:24px 0 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text-3)">Strategy Builder</h3>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+    <h3 class="section-head">Strategy Builder</h3>
+    <div class="strat-chips">
       ${["Long Straddle", "Strangle", "Bull Call Spread", "Iron Condor"].map(
     (s) => `<button class="chip" data-strat="${s}">${s}</button>`
   ).join("")}
     </div>
     <div id="stratOut"></div>`;
-  overlay.innerHTML = screenShell(`Options \u2014 ${sym()}`, body);
+  overlay.innerHTML = screenShell(`Options \u2014 ${sym().replace("-USD", "")}`, body);
   document.getElementById("backBtn").onclick = closeScreen;
   overlay.querySelectorAll("[data-exp]").forEach((b) => b.onclick = () => {
     state.optExpiryIdx = +b.dataset.exp;
@@ -4099,18 +4536,13 @@ function renderOptionsScreen() {
   overlay.querySelectorAll("[data-opt]").forEach((b) => b.onclick = () => {
     const [right, k] = b.dataset.opt.split(":");
     const q = (right === "call" ? exp.calls : exp.puts).find((x) => x.spec.strike === +k);
-    tradeOption(q);
+    openOptionTicket(q);
   });
   overlay.querySelectorAll("[data-strat]").forEach((b) => b.onclick = () => buildStrategy(b.dataset.strat, exp, p.spot));
-}
-function tradeOption(q) {
-  const res = store.submit({ target: { kind: "option", symbol: q.spec.underlying, option: q.spec }, side: "buy", qty: 1, type: "market", tif: "DAY" });
-  if (!res.ok) {
-    toast(res.reason ?? "Rejected", "loss");
-    return;
-  }
-  toast(W().mode === "live" ? "Option filled" : "Option order \u2014 fills next bar", "gain");
-  refresh();
+  overlay.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => {
+    closePosition(b.dataset.close);
+    renderOptionsScreen();
+  });
 }
 function buildStrategy(name, exp, spot) {
   const calls = exp.calls, puts = exp.puts;
@@ -4153,6 +4585,7 @@ function buildStrategy(name, exp, spot) {
     }
     toast(`${strat.name} submitted`, "gain");
     refresh();
+    renderOptionsScreen();
   };
 }
 function renderStatsScreen() {
@@ -4161,8 +4594,8 @@ function renderStatsScreen() {
   const totalPnl = Number(r.totalPnl);
   const body = `
     <div class="card">
-      <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.06em">Total Equity</div>
-      <div class="num" style="font-size:32px;font-weight:700;margin-top:4px">${money(r.equity)}</div>
+      <div class="muted spot-k">Total Equity</div>
+      <div class="num stats-hero">${money(r.equity)}</div>
       <div class="num ${pnlClass(totalPnl)}" style="margin-top:4px">${glyph(totalPnl)} ${money(totalPnl, { sign: true })} total P&amp;L</div>
       <canvas id="eqCurve" style="width:100%;height:140px;margin-top:16px;display:block"></canvas>
     </div>
@@ -4175,26 +4608,9 @@ function renderStatsScreen() {
       ${stat("Trades", String(r.trade.trades))}
       ${stat("Avg Win", money(Number(r.trade.avgWin)), "gain")}
       ${stat("Avg Loss", money(Number(r.trade.avgLoss)), "loss")}
-      ${stat("Max Drawdown", money(Number(r.drawdown.maxDrawdown)) + ` (${(r.drawdown.maxDrawdownPct * 100).toFixed(1)}%)`, "loss")}
+      ${stat("Max Drawdown", (r.drawdown.maxDrawdownPct * 100).toFixed(1) + "%", "loss")}
       ${stat("Avg Hold", r.trade.avgHoldHours.toFixed(1) + "h")}
-      ${stat("Turnover", r.turnover.toFixed(2) + "x")}
-      ${stat("Peak Equity", money(Number(r.drawdown.peakEquity)))}
-    </div>
-    ${r.options.assignments + r.options.exercised + r.options.expiredWorthless > 0 || r.options.avgEntryIv > 0 ? `
-    <h3 style="margin:4px 0 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text-3)">Options</h3>
-    <div class="stat-grid">
-      ${stat("Avg Entry IV", (r.options.avgEntryIv * 100).toFixed(0) + "%")}
-      ${stat("Theta P&L", money(Number(r.options.thetaCapturedOrPaid)), pnlClass(Number(r.options.thetaCapturedOrPaid)))}
-      ${stat("Exercised", String(r.options.exercised))}
-      ${stat("Assigned", String(r.options.assignments))}
-    </div>` : ""}
-    ${r.byAssetClass.length ? `
-    <h3 style="margin:4px 0 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text-3)">By Asset Class</h3>
-    <div class="card">${r.byAssetClass.map((b) => `<div class="row-between" style="padding:7px 0;border-bottom:1px solid var(--hairline-2)">
-        <span>${b.key}</span>
-        <span class="num ${pnlClass(Number(b.realized))}">${money(Number(b.realized), { sign: true })} <span class="dim">${b.trades} trades</span></span>
-      </div>`).join("")}
-    </div>` : ""}`;
+    </div>`;
   overlay.innerHTML = screenShell("Statistics", body);
   document.getElementById("backBtn").onclick = closeScreen;
   requestAnimationFrame(() => drawEquityCurve(
@@ -4208,11 +4624,6 @@ function stat(k, v, cls = "") {
 }
 function renderLearnScreen() {
   const overlay = overlayEl();
-  if (!getCurriculum(W())) {
-    overlay.innerHTML = screenShell("Learn", `<div class="empty" style="padding:24px">Help is disabled. Enable Help in Settings to access the learning track.</div>`);
-    document.getElementById("backBtn").onclick = closeScreen;
-    return;
-  }
   if (state.learnModule) return renderModule(state.learnModule);
   const map = store.progress.completionMap();
   const body = `
@@ -4224,13 +4635,12 @@ function renderLearnScreen() {
           <span>${m.index}. ${m.title}</span>
           ${st.passed ? `<span class="badge done">\u2713 ${(st.bestScore * 100).toFixed(0)}%</span>` : ""}
           ${!st.unlocked ? `<span class="badge">Locked</span>` : ""}
-          ${m.checkpoint ? `<span class="badge" style="font-size:10px">Checkpoint</span>` : ""}
         </div>
         <div class="lesson-body">${m.summary}</div>
       </div>`;
   }).join("")}`;
   overlay.innerHTML = screenShell("Learn Options", body);
-  document.getElementById("backBtn").onclick = closeScreen;
+  document.getElementById("backBtn").onclick = renderSettingsScreen;
   overlay.querySelectorAll("[data-mod]").forEach((b) => b.onclick = () => {
     state.learnModule = b.dataset.mod;
     renderModule(b.dataset.mod);
@@ -4241,19 +4651,11 @@ function renderModule(id) {
   const m = CURRICULUM.find((x) => x.id === id);
   const answers = {};
   const body = `
-    ${m.lessons.map((l) => `
-      <div class="card">
-        <strong>${l.title}</strong>
-        <div class="lesson-body">${l.body}</div>
-        ${l.demo ? `<div class="dim mt" style="font-size:12px">\u26A1 Interactive: ${l.demo.note} (${l.demo.underlying})</div>` : ""}
-      </div>`).join("")}
+    ${m.lessons.map((l) => `<div class="card"><strong>${l.title}</strong><div class="lesson-body">${l.body}</div></div>`).join("")}
     <h3 style="margin:16px 0 10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--text-3)">Quiz \u2014 pass \u2265 ${(m.passThreshold * 100).toFixed(0)}%</h3>
     <div id="quiz">
-      ${m.quiz.map((q) => `
-        <div class="card" data-q="${q.id}">
-          <strong>${q.prompt}</strong>
-          ${q.options.map((o, i) => `<button class="quiz-opt" data-pick="${q.id}:${i}">${o}</button>`).join("")}
-        </div>`).join("")}
+      ${m.quiz.map((q) => `<div class="card" data-q="${q.id}"><strong>${q.prompt}</strong>
+        ${q.options.map((o, i) => `<button class="quiz-opt" data-pick="${q.id}:${i}">${o}</button>`).join("")}</div>`).join("")}
     </div>
     <button class="submit buy" id="grade" style="max-width:280px">Submit Quiz</button>
     <div class="note" id="quizNote"></div>`;
@@ -4279,65 +4681,55 @@ function renderModule(id) {
     const note = document.getElementById("quizNote");
     note.style.color = res.passed ? "var(--gain)" : "var(--loss)";
     note.textContent = `${(res.bestScore * 100).toFixed(0)}% \u2014 ${res.passed ? "Passed \u2713" : "Keep going \u2014 review and retake."}`;
-    renderSidebar();
   };
 }
 function renderSettingsScreen() {
   const overlay = overlayEl();
   const s = W().settings;
+  const learnRow = s.helpEnabled ? `<button class="link-row" id="openLearn">
+        <div class="label"><div>Learning track</div><div class="sub">Options curriculum \u2014 ${(store.progress.overallProgress() * 100).toFixed(0)}% complete</div></div>
+        <span class="link-arrow">\u203A</span>
+      </button>` : "";
   const body = `
     <div class="card">
-      ${toggleRow("Help & Learning", "Terminal teaching notes and the options learning track. Off = pure analytical mode.", s.helpEnabled, "helpEnabled")}
+      ${toggleRow("Live market prices", "Crypto prices update from Coinbase in real time. Off = deterministic practice mode.", store.live, "liveMode")}
+      ${toggleRow("Help & Learning", "Enable the options learning track and terminal commentary.", s.helpEnabled, "helpEnabled")}
       ${toggleRow("Fee & spread realism", "Model bid/ask spread, slippage and fees on fills.", s.feeRealism, "feeRealism")}
-      ${toggleRow("Live crypto mode", "Crypto follows real-time price; orders fill immediately.", W().mode === "live", "liveMode")}
       ${toggleRow("Light theme", "Switch to the light appearance.", store.ui.theme === "light", "theme")}
     </div>
+    ${learnRow ? `<div class="card" style="padding:0">${learnRow}</div>` : ""}
     <div class="card">
-      <div class="set-row">
-        <div class="label">
-          <div>Add funds</div>
-          <div class="sub">Current cash: ${money(W().portfolio.cash.toNumber())}</div>
-        </div>
-      </div>
-      <div style="display:flex;gap:8px;margin-top:2px">
-        <input class="input num" id="depAmt" inputmode="decimal" placeholder="10000" style="max-width:160px">
+      <div class="set-row"><div class="label"><div>Add funds</div><div class="sub">Current cash: ${money(W().portfolio.cash.toNumber())}</div></div></div>
+      <div class="inline-row">
+        <input class="input num" id="depAmt" inputmode="decimal" placeholder="500">
         <button class="adv-btn" id="depBtn">Deposit</button>
       </div>
     </div>
     <div class="card">
-      <div class="set-row">
-        <div class="label"><div>Risk-free rate</div><div class="sub">Used for option pricing (BSM/BAW)</div></div>
-        <input class="input num" id="rfr" style="width:80px" value="${(s.riskFreeRate * 100).toFixed(1)}">
-      </div>
-      <div class="set-row">
-        <div class="label"><div>Margin multiplier</div><div class="sub">Buying-power leverage</div></div>
-        <input class="input num" id="marg" style="width:80px" value="${s.marginMultiplier}">
-      </div>
+      <div class="set-row"><div class="label"><div>Risk-free rate</div><div class="sub">Used for option pricing (BSM/BAW)</div></div>
+        <input class="input num" id="rfr" style="width:72px" value="${(s.riskFreeRate * 100).toFixed(1)}"></div>
     </div>
     <div class="card">
       <div class="set-row" style="border-bottom:none;padding-bottom:6px">
-        <div class="label">
-          <div>Reset account</div>
-          <div class="sub">Wipe portfolio, orders and clock back to the start, and set a fresh starting bankroll.</div>
-        </div>
+        <div class="label"><div>Reset account</div><div class="sub">Wipe positions, orders and clock to a fresh start.</div></div>
       </div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <label class="dim" style="font-size:12px">Starting bankroll</label>
-        <input class="input num" id="resetCash" style="max-width:160px" value="${Math.round(W().settings.startingCash)}">
-        <button class="adv-btn" id="resetBtn" style="color:var(--loss);border-color:var(--loss);margin-left:auto">Reset</button>
+      <div class="inline-row">
+        <input class="input num" id="resetCash" value="${Math.round(W().settings.startingCash)}" placeholder="1000">
+        <button class="adv-btn danger" id="resetBtn">Reset</button>
       </div>
     </div>
     <div class="card">
       <strong>About ORION</strong>
-      <div class="lesson-body">
-        ORION uses historical and/or delayed market data for trading practice.
-        It holds no real funds and places no real orders. All prices, fills, options and
-        Greeks are modeled \u2014 not financial advice.
-      </div>
+      <div class="lesson-body">ORION uses historical and/or delayed market data for trading practice. It holds no real funds and places no real orders. All prices, fills, options and Greeks are modeled \u2014 not financial advice.</div>
     </div>`;
   overlay.innerHTML = screenShell("Settings", body);
   document.getElementById("backBtn").onclick = closeScreen;
   overlay.querySelectorAll("[data-toggle]").forEach((b) => b.onclick = () => onToggle(b.dataset.toggle));
+  const ol = document.getElementById("openLearn");
+  if (ol) ol.onclick = () => {
+    state.learnModule = null;
+    renderLearnScreen();
+  };
   document.getElementById("depBtn").onclick = () => {
     const v = parseFloat(document.getElementById("depAmt").value);
     if (v > 0) {
@@ -4350,16 +4742,13 @@ function renderSettingsScreen() {
   document.getElementById("rfr").addEventListener("change", (e) => {
     store.updateSettings({ riskFreeRate: (parseFloat(e.target.value) || 4) / 100 });
   });
-  document.getElementById("marg").addEventListener("change", (e) => {
-    store.updateSettings({ marginMultiplier: parseFloat(e.target.value) || 1 });
-    refresh();
-  });
   document.getElementById("resetBtn").onclick = () => {
     const cash = Math.max(0, parseFloat(document.getElementById("resetCash").value) || W().settings.startingCash);
-    if (confirm(`Reset your account to a ${money(cash)} bankroll? This wipes portfolio, orders and clock.`)) {
+    if (confirm(`Reset account to ${money(cash)} bankroll? This wipes all positions, orders and history.`)) {
       store.reset(cash);
       state.screen = "trade";
       renderShell();
+      maybeAutoLive();
       toast(`Account reset \u2014 ${money(cash)} bankroll`);
     }
   };
@@ -4371,16 +4760,30 @@ function toggleRow(label, sub, on, key) {
   </div>`;
 }
 function onToggle(key) {
-  if (key === "helpEnabled") {
-    store.updateSettings({ helpEnabled: !W().settings.helpEnabled });
-    renderSidebar();
-  } else if (key === "feeRealism") store.updateSettings({ feeRealism: !W().settings.feeRealism });
-  else if (key === "liveMode") store.setMode(W().mode === "live" ? "historical" : "live");
-  else if (key === "theme") {
+  if (key === "helpEnabled") store.updateSettings({ helpEnabled: !W().settings.helpEnabled });
+  else if (key === "feeRealism") store.updateSettings({ feeRealism: !W().settings.feeRealism });
+  else if (key === "liveMode") {
+    if (store.live) {
+      store.ui.livePref = false;
+      store.saveUi();
+      store.disableLive();
+      toast("Practice mode");
+    } else {
+      store.ui.livePref = true;
+      store.saveUi();
+      toast("Connecting to live prices\u2026");
+      void store.enableLive().then(() => {
+        toast(store.live ? "Live prices active" : "Could not connect \u2014 staying in practice", store.live ? "gain" : "");
+        renderSettingsScreen();
+        refresh();
+      });
+      return;
+    }
+  } else if (key === "theme") {
     store.ui.theme = store.ui.theme === "light" ? "dark" : "light";
     store.saveUi();
     document.documentElement.setAttribute("data-theme", store.ui.theme);
-    chart.setData(visibleBars());
+    chart?.setData(visibleBars());
   }
   renderSettingsScreen();
   refresh();
@@ -4389,7 +4792,7 @@ function toast(msg, cls = "") {
   const t = document.getElementById("toast");
   t.className = `toast show ${cls}`;
   t.textContent = msg;
-  setTimeout(() => t.className = "toast", 2e3);
+  setTimeout(() => t.className = "toast", 2400);
 }
 function ceilTo(t, step) {
   return Math.ceil(t / step) * step;
@@ -4404,7 +4807,7 @@ function brandLogoLarge() {
 }
 function brandMark() {
   return `<div class="brand-inner">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
       <circle cx="5" cy="17" r="2" fill="var(--accent)"/>
       <circle cx="12" cy="11" r="2" fill="var(--accent)" opacity="0.75"/>
       <circle cx="19" cy="5" r="2" fill="var(--accent)" opacity="0.5"/>
@@ -4413,39 +4816,20 @@ function brandMark() {
     <span class="wordmark">ORION</span>
   </div>`;
 }
-function tradeIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-    <line x1="7" y1="4" x2="7" y2="6.5"/>
-    <rect x="4.5" y="6.5" width="5" height="7" rx="0.75"/>
-    <line x1="7" y1="13.5" x2="7" y2="16"/>
-    <line x1="15" y1="7" x2="15" y2="9.5"/>
-    <rect x="12.5" y="9.5" width="5" height="6" rx="0.75"/>
-    <line x1="15" y1="15.5" x2="15" y2="18"/>
-  </svg>`;
+function iChart() {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3,16 8,10 12,13 17,6 21,9"/><polyline points="17,6 21,6 21,10"/></svg>`;
 }
-function optionsIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M9 19H5a2 2 0 0 1-2-2v-4c0-1.1.9-2 2-2h4"/>
-    <path d="M15 5h4a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-4"/>
-    <line x1="12" y1="5" x2="12" y2="19"/>
-  </svg>`;
+function iBook() {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4" width="17" height="16" rx="2.5"/><line x1="3.5" y1="9.5" x2="20.5" y2="9.5"/><line x1="9" y1="9.5" x2="9" y2="20"/></svg>`;
 }
-function statsIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-    <polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/>
-  </svg>`;
+function iOptions() {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3"/></svg>`;
 }
-function learnIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
-    <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
-  </svg>`;
+function iStats() {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="20" x2="6" y2="12"/><line x1="12" y1="20" x2="12" y2="5"/><line x1="18" y1="20" x2="18" y2="9"/></svg>`;
 }
-function settingsIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="12" cy="12" r="3"/>
-    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-  </svg>`;
+function iSettings() {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
 }
 boot();
 //# sourceMappingURL=bundle.js.map
