@@ -96,6 +96,20 @@ function renderShell() {
         <div class="trade-view">
           <div class="chart-area">
             <div class="chart-toolbar" id="chartToolbar"></div>
+            <div class="quickbar">
+              <div class="qb-funds">
+                <span class="qb-k">Available</span>
+                <span class="qb-v num" id="qbBp">—</span>
+              </div>
+              <div class="qb-funds qb-eq">
+                <span class="qb-k">Equity</span>
+                <span class="qb-v num" id="qbEq">—</span>
+              </div>
+              <div class="qb-actions">
+                <button class="qb-btn buy" id="qbBuy">Buy</button>
+                <button class="qb-btn sell" id="qbSell">Sell</button>
+              </div>
+            </div>
             <div class="chart-wrap"><canvas id="chart"></canvas></div>
             <div class="timebar">
               <span class="time-label" id="timeLabel"></span>
@@ -129,6 +143,8 @@ function renderShell() {
   renderDrawerBody();
   wireTime();
   wireDrawerClose();
+  document.getElementById("qbBuy")!.onclick = () => openTicket("buy");
+  document.getElementById("qbSell")!.onclick = () => openTicket("sell");
   // Restore the active screen overlay if not on trade.
   if (state.screen !== "trade") mountScreen(state.screen);
   refresh();
@@ -266,6 +282,20 @@ function openScanTab() {
   document.getElementById("drawer")!.classList.add("open");
   renderDrawerTabs();
   renderDrawerBody();
+}
+
+// One-tap entry into the order ticket with a preset side. If a screen overlay
+// is open (Options/Stats/etc.), drop back to the trade surface first.
+function openTicket(side: Side) {
+  if (state.screen !== "trade") navigate("trade");
+  state.form.side = side;
+  state.drawerTab = "trade";
+  state.drawerOpen = true;
+  document.getElementById("drawer")!.classList.add("open");
+  renderDrawerTabs();
+  renderDrawerBody();
+  const q = document.getElementById("qty") as HTMLInputElement | null;
+  if (q) { q.focus(); q.select(); }
 }
 
 function wireDrawerClose() {
@@ -499,16 +529,26 @@ function animateAdvance(from: number, target: number) {
   state.scrubbing = true;
   app.classList.add("scrubbing");
   setAdvButtons(false);
-  const dur = 650;
+  const span = target - from;
+  // Engine step granularity: minute bars for short hops, hourly for long ones.
+  const stepRes: Resolution = span > 2 * 86400_000 ? "1h" : "1m";
+  const barMs = stepRes === "1h" ? 3600_000 : 60_000;
+  // Cap bars processed per frame so a 30-day jump scrubs smoothly instead of
+  // freezing while the engine grinds through hundreds of bars at once.
+  const maxBarsPerFrame = 18;
+  const dur = 750;
   const t0 = performance.now();
-  const ease = (k: number) => 1 - Math.pow(1 - k, 3);
+  // easeInOutCubic — gentle acceleration and settle.
+  const ease = (k: number) => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
   function frame(now: number) {
     const k = Math.min(1, (now - t0) / dur);
-    const inter = Math.round(from + (target - from) * ease(k));
-    if (inter > W().now) W().advanceTo(inter, { stepRes: target - from > 2 * 86400_000 ? "1h" : "1m" });
+    let want = from + span * ease(k);
+    const cap = W().now + maxBarsPerFrame * barMs;
+    if (want > cap) want = cap;
+    if (want > W().now) W().advanceTo(want, { stepRes });
     chart.setData(visibleBars());
     updateHeader();
-    if (k < 1) requestAnimationFrame(frame);
+    if (W().now < target) requestAnimationFrame(frame);
     else finishAdvance(target);
   }
   requestAnimationFrame(frame);
@@ -542,10 +582,15 @@ function updateHeader() {
       <div class="chg num ${F.pnlClass(chg)}">${F.glyph(chg)} ${F.pct(chg)}</div>`;
   }
 
+  const eq = W().equity().toNumber();
+  const bp = W().buyingPower().toNumber();
+  const qbBp = document.getElementById("qbBp");
+  if (qbBp) qbBp.textContent = F.money(bp);
+  const qbEq = document.getElementById("qbEq");
+  if (qbEq) qbEq.textContent = F.money(eq);
+
   const acctEl = document.getElementById("topbarAcct");
   if (acctEl) {
-    const eq = W().equity().toNumber();
-    const bp = W().buyingPower().toNumber();
     const upnl = W().unrealized().toNumber();
     const totalPnl = eq - W().settings.startingCash;
     acctEl.innerHTML = `

@@ -28,13 +28,20 @@ interface Persisted {
   progress: Record<string, unknown>;
 }
 
-const KEY = "orion.session.v2";
-const START = Date.UTC(2023, 0, 2);
+const KEY = "orion.session.v3";
 const DAYS = 60;
 // Begin the clock well into the dataset so there is real chart history to read
 // (and enough closed bars for SMA/EMA/Bollinger to compute) while leaving a
 // long unknown future to trade into.
 const HISTORY_DAYS = 25;
+// Anchor the dataset to the present: the data window starts HISTORY_DAYS before
+// "now" (rounded to a UTC day), so the simulated clock opens at today's date
+// with realistic, current-feeling price levels rather than a stale historical
+// year. A returning session keeps its own persisted `start`.
+const START = (() => {
+  const d = new Date();
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - HISTORY_DAYS * 24 * 3600_000;
+})();
 
 export class Store {
   world!: World;

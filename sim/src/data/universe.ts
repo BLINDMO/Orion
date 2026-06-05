@@ -87,12 +87,12 @@ export function barsPerYear(calendar: "24x7" | "us-equity", resolutionMinutes: n
 }
 
 const SEED_SPECS: Record<string, Partial<SyntheticSpec>> = {
-  "BTC-USD": { seed: 1001, startPrice: 16500, driftAnnual: 0.35, volAnnual: 0.65 },
-  "ETH-USD": { seed: 1002, startPrice: 1200, driftAnnual: 0.3, volAnnual: 0.8 },
-  "SOL-USD": { seed: 1003, startPrice: 11, driftAnnual: 0.5, volAnnual: 1.1 },
-  ACME: { seed: 2001, startPrice: 95, driftAnnual: 0.1, volAnnual: 0.28 },
-  NOVA: { seed: 2002, startPrice: 140, driftAnnual: 0.12, volAnnual: 0.35 },
-  ORN: { seed: 2003, startPrice: 60, driftAnnual: 0.18, volAnnual: 0.45 },
+  "BTC-USD": { seed: 1001, startPrice: 96000, driftAnnual: 0.35, volAnnual: 0.55 },
+  "ETH-USD": { seed: 1002, startPrice: 3400, driftAnnual: 0.3, volAnnual: 0.7 },
+  "SOL-USD": { seed: 1003, startPrice: 165, driftAnnual: 0.5, volAnnual: 0.95 },
+  ACME: { seed: 2001, startPrice: 240, driftAnnual: 0.1, volAnnual: 0.28 },
+  NOVA: { seed: 2002, startPrice: 420, driftAnnual: 0.12, volAnnual: 0.35 },
+  ORN: { seed: 2003, startPrice: 130, driftAnnual: 0.18, volAnnual: 0.45 },
 };
 
 /**

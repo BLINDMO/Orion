@@ -296,6 +296,37 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; bo
 }
 .terminal-btn:hover { background: rgba(76, 141, 255, 0.18); }
 canvas { display: block; }
+
+/* Quick-trade bar: always-visible funds + one-tap buy/sell */
+.quickbar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 12px;
+  height: 42px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--ink-elev);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.qb-funds { display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; }
+.qb-funds .qb-k { font-size: 9px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-3); }
+.qb-funds .qb-v { font-size: 14px; font-weight: 700; }
+.qb-actions { margin-left: auto; display: flex; gap: 8px; flex-shrink: 0; }
+.qb-btn {
+  padding: 8px 22px;
+  border-radius: var(--r-md);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: #fff;
+  transition: filter 0.12s, transform 0.1s;
+}
+.qb-btn.buy { background: var(--gain); }
+.qb-btn.sell { background: var(--loss); }
+.qb-btn:hover { filter: brightness(1.1); }
+.qb-btn:active { transform: scale(0.97); }
+
 .chart-wrap { flex: 1; position: relative; min-height: 0; overflow: hidden; background: var(--ink); }
 #chart { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
 
@@ -759,6 +790,9 @@ table.chain .buyc:hover { color: var(--gain); text-decoration: underline; }
   .drawer-close { display: flex; }
   .topbar-acct { display: none; }
   .topbar-price .px { font-size: 18px; }
+  .quickbar { gap: 14px; }
+  .qb-eq { display: none; }
+  .qb-btn { padding: 8px 18px; }
   .chart-toolbar { gap: 6px; padding: 0 10px; }
   .toolbar-btn { padding: 5px 8px; font-size: 10px; }
 }
