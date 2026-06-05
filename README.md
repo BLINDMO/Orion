@@ -45,6 +45,21 @@ introduce look-ahead.
 cd app && npm i -D esbuild && npm run build && npm run serve   # http://localhost:5173
 ```
 
+### Live site (GitHub Pages)
+
+The built app is committed to [`docs/`](docs/) and is served by GitHub Pages
+**without any build step or CI** once Pages is pointed at that folder:
+
+> **https://blindmo.github.io/Orion/**
+
+**One-time setup** (repo **Settings → Pages**): set **Source = "Deploy from a
+branch"**, **Branch = `claude/orion-trading-simulator-paatT`**, **Folder =
+`/docs`**, then **Save**. The site goes live in a minute or two. Re-publish after
+changes with `cd app && npm run build:docs` and commit `docs/`.
+
+A GitHub Actions workflow (`.github/workflows/pages.yml`) is also included for an
+automated build-and-deploy; use it instead if Actions is enabled for the repo.
+
 It covers the full loop: candlestick charting with indicators and the Terminal
 scanner, an institutional order ticket (market/limit/stop/stop-limit/trailing),
 player-controlled time with animated scrubbing, the options chain + multi-leg
