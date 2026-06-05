@@ -1716,11 +1716,12 @@ function targetKey(t) {
   return t.kind === "option" && t.option ? optionKey(t.option) : t.symbol;
 }
 var DEFAULT_SETTINGS = {
-  startingCash: 25e3,
+  startingCash: 1e3,
   riskFreeRate: 0.04,
   dividendYield: 0.01,
   feeRealism: true,
-  marginMultiplier: 2,
+  // 1× buying power so displayed available funds equal cash (no misleading 2×).
+  marginMultiplier: 1,
   helpEnabled: true,
   maintenanceMargin: 0.25
 };
