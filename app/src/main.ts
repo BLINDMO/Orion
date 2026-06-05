@@ -19,7 +19,6 @@ import {
   ironCondor,
 } from "../../sim/src/options/strategies.ts";
 import { Store } from "./store.ts";
-import { isLiveSymbol } from "./live.ts";
 import { Chart } from "./ui/chart.ts";
 import { drawEquityCurve, drawPayoff } from "./ui/canvas.ts";
 import * as F from "./ui/format.ts";

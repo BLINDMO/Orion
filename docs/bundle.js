@@ -2932,7 +2932,6 @@ var Store = class {
   ui = { symbol: "BTC-USD", theme: "dark", onboarded: false, livePref: true };
   settings;
   profileId;
-  // Live mode state
   live = false;
   onLiveTick = null;
   histWorld = null;
@@ -3036,73 +3035,8 @@ var Store = class {
     this.actions = [];
     this.record({ k: "reset", startingCash });
   }
-  /** Record an advance the UI already applied to the world (animated scrubbing). */
   noteAdvance(to) {
     if (!this.live) this.record({ k: "advance", to });
-  }
-  // ── Live market data ────────────────────────────────────────────────────
-  /**
-   * Switch to a live world driven by real crypto prices. Fetches recent candles
-   * for each live symbol, builds a fresh world anchored at the real last close,
-   * and starts polling. Throws (leaving the historical world intact) on failure.
-   */
-  async enableLive(fetcher) {
-    if (this.live) return;
-    const data = buildSeedData(START, DAYS);
-    let now = 0;
-    for (const sym2 of LIVE_SYMBOLS) {
-      const snap = await fetchSymbol(sym2, fetcher);
-      const series = {};
-      for (const res of ["1h", "1d"]) {
-        const bars = snap.bars[res];
-        if (bars && bars.length) {
-          series[res] = new BarSeries(res, bars);
-          const last = bars[bars.length - 1];
-          now = Math.max(now, last.t + RES_MS[res]);
-        }
-      }
-      if (Object.keys(series).length) data.set(sym2, new InstrumentData(sym2, series));
-    }
-    if (!now) throw new Error("No live data returned");
-    this.histWorld = this.world;
-    this.world = new World({ universe, data, startNow: now, settings: { ...this.world.settings } });
-    this.world.setMode("live");
-    this.live = true;
-    this.liveTimer = setInterval(() => {
-      void this.pollLive(fetcher);
-    }, 3e4);
-  }
-  async pollLive(fetcher) {
-    if (!this.live) return;
-    let now = this.world.now;
-    for (const sym2 of LIVE_SYMBOLS) {
-      try {
-        const snap = await fetchSymbol(sym2, fetcher);
-        const id = this.world.data.get(sym2);
-        if (!id) continue;
-        for (const res of ["1h", "1d"]) {
-          const bars = snap.bars[res];
-          if (bars && bars.length) {
-            id.appendLive(res, bars);
-            now = Math.max(now, bars[bars.length - 1].t + RES_MS[res]);
-          }
-        }
-      } catch {
-      }
-    }
-    if (now > this.world.now) this.world.advanceTo(now, { stepRes: "1h" });
-    this.onLiveTick?.();
-  }
-  /** Return to the deterministic historical world. */
-  disableLive() {
-    if (!this.live) return;
-    if (this.liveTimer) {
-      clearInterval(this.liveTimer);
-      this.liveTimer = null;
-    }
-    if (this.histWorld) this.world = this.histWorld;
-    this.histWorld = null;
-    this.live = false;
   }
   record(a) {
     if (this.live) return;
@@ -3110,6 +3044,8 @@ var Store = class {
     this.save();
   }
   // ── Live mode ─────────────────────────────────────────────────────────────
+  // Build a fresh live world anchored to real current time — always works
+  // regardless of where the historical simulation's clock is positioned.
   async enableLive() {
     if (this.live) return;
     const now = Date.now();
@@ -3125,12 +3061,7 @@ var Store = class {
       })
     );
     this.histWorld = this.world;
-    this.world = new World({
-      universe,
-      data: liveData,
-      startNow: now,
-      settings: this.settings
-    });
+    this.world = new World({ universe, data: liveData, startNow: now, settings: this.settings });
     this.world.setMode("live");
     this.live = true;
     this.liveTimer = setInterval(() => {
@@ -3189,7 +3120,7 @@ var Store = class {
       return null;
     }
   }
-  // ── Profile management (static — no world access needed) ──────────────────
+  // ── Profile management ────────────────────────────────────────────────────
   getProfileName() {
     return loadPL().list.find((p) => p.id === this.profileId)?.name ?? "Profile";
   }
@@ -4820,35 +4751,6 @@ function toast(msg, cls = "") {
 }
 function ceilTo(t, step) {
   return Math.ceil(t / step) * step;
-}
-async function toggleLive() {
-  if (store.live) {
-    store.disableLive();
-    store.onLiveTick = null;
-    toast("Live data off \u2014 back to simulator");
-    if (store.ui.symbol && !W().universe.has(store.ui.symbol)) store.ui.symbol = "BTC-USD";
-    renderShell();
-    return;
-  }
-  if (!isLiveSymbol(store.ui.symbol)) {
-    store.ui.symbol = "BTC-USD";
-    store.saveUi();
-  }
-  toast("Connecting to live market data\u2026");
-  try {
-    await store.enableLive();
-    store.onLiveTick = onLiveTick;
-    renderShell();
-    toast("Live market data on", "gain");
-  } catch (e) {
-    toast("Couldn't reach live data \u2014 staying in simulator", "loss");
-    console.warn("Live data failed:", e);
-    renderSettingsScreen();
-  }
-}
-function onLiveTick() {
-  if (state.screen === "trade") chart.setData(visibleBars());
-  refresh();
 }
 function brandLogoLarge() {
   return `<svg class="splash-logo" width="64" height="64" viewBox="0 0 24 24" fill="none">
