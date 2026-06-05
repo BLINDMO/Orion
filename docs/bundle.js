@@ -3040,7 +3040,72 @@ var Store = class {
   noteAdvance(to) {
     if (!this.live) this.record({ k: "advance", to });
   }
+  // ── Live market data ────────────────────────────────────────────────────
+  /**
+   * Switch to a live world driven by real crypto prices. Fetches recent candles
+   * for each live symbol, builds a fresh world anchored at the real last close,
+   * and starts polling. Throws (leaving the historical world intact) on failure.
+   */
+  async enableLive(fetcher) {
+    if (this.live) return;
+    const data = buildSeedData(START, DAYS);
+    let now = 0;
+    for (const sym2 of LIVE_SYMBOLS) {
+      const snap = await fetchSymbol(sym2, fetcher);
+      const series = {};
+      for (const res of ["1h", "1d"]) {
+        const bars = snap.bars[res];
+        if (bars && bars.length) {
+          series[res] = new BarSeries(res, bars);
+          const last = bars[bars.length - 1];
+          now = Math.max(now, last.t + RES_MS[res]);
+        }
+      }
+      if (Object.keys(series).length) data.set(sym2, new InstrumentData(sym2, series));
+    }
+    if (!now) throw new Error("No live data returned");
+    this.histWorld = this.world;
+    this.world = new World({ universe, data, startNow: now, settings: { ...this.world.settings } });
+    this.world.setMode("live");
+    this.live = true;
+    this.liveTimer = setInterval(() => {
+      void this.pollLive(fetcher);
+    }, 3e4);
+  }
+  async pollLive(fetcher) {
+    if (!this.live) return;
+    let now = this.world.now;
+    for (const sym2 of LIVE_SYMBOLS) {
+      try {
+        const snap = await fetchSymbol(sym2, fetcher);
+        const id = this.world.data.get(sym2);
+        if (!id) continue;
+        for (const res of ["1h", "1d"]) {
+          const bars = snap.bars[res];
+          if (bars && bars.length) {
+            id.appendLive(res, bars);
+            now = Math.max(now, bars[bars.length - 1].t + RES_MS[res]);
+          }
+        }
+      } catch {
+      }
+    }
+    if (now > this.world.now) this.world.advanceTo(now, { stepRes: "1h" });
+    this.onLiveTick?.();
+  }
+  /** Return to the deterministic historical world. */
+  disableLive() {
+    if (!this.live) return;
+    if (this.liveTimer) {
+      clearInterval(this.liveTimer);
+      this.liveTimer = null;
+    }
+    if (this.histWorld) this.world = this.histWorld;
+    this.histWorld = null;
+    this.live = false;
+  }
   record(a) {
+    if (this.live) return;
     this.actions.push(a);
     this.save();
   }
@@ -3981,7 +4046,9 @@ function renderScanBody() {
       </div>`).join("") : ""}`;
 }
 function openTicket(side) {
-  if (state.screen !== "trade") navigate("trade");
+  if (state.screen !== "trade") {
+    navigate("trade");
+  }
   state.form.side = side;
   state.ticketOpen = true;
   const sheet = document.getElementById("ticketSheet");
@@ -4214,6 +4281,10 @@ function closePosition(key) {
   refresh();
 }
 function wireTime() {
+  if (store.live) {
+    setAdvButtons(false);
+    return;
+  }
   document.querySelectorAll("[data-adv]").forEach((b) => b.onclick = () => {
     if (state.scrubbing || store.live) return;
     const kind = b.dataset.adv;
@@ -4288,7 +4359,7 @@ function updateHeader() {
       <div class="acct-item"><span class="k">P&amp;L</span><span class="v num ${pnlClass(totalPnl)}">${money(totalPnl, { sign: true })}</span></div>`;
   }
   const tl = document.getElementById("timeLabel");
-  if (tl) tl.textContent = `\u25F7 ${dateLabel(W().now)}`;
+  if (tl) tl.textContent = store.live ? `\u25F7 ${dateLabel(W().now)} \xB7 streaming` : `\u25F7 ${dateLabel(W().now)}`;
   const mp = document.getElementById("modePill");
   if (mp) {
     if (store.live) {
@@ -4749,6 +4820,35 @@ function toast(msg, cls = "") {
 }
 function ceilTo(t, step) {
   return Math.ceil(t / step) * step;
+}
+async function toggleLive() {
+  if (store.live) {
+    store.disableLive();
+    store.onLiveTick = null;
+    toast("Live data off \u2014 back to simulator");
+    if (store.ui.symbol && !W().universe.has(store.ui.symbol)) store.ui.symbol = "BTC-USD";
+    renderShell();
+    return;
+  }
+  if (!isLiveSymbol(store.ui.symbol)) {
+    store.ui.symbol = "BTC-USD";
+    store.saveUi();
+  }
+  toast("Connecting to live market data\u2026");
+  try {
+    await store.enableLive();
+    store.onLiveTick = onLiveTick;
+    renderShell();
+    toast("Live market data on", "gain");
+  } catch (e) {
+    toast("Couldn't reach live data \u2014 staying in simulator", "loss");
+    console.warn("Live data failed:", e);
+    renderSettingsScreen();
+  }
+}
+function onLiveTick() {
+  if (state.screen === "trade") chart.setData(visibleBars());
+  refresh();
 }
 function brandLogoLarge() {
   return `<svg class="splash-logo" width="64" height="64" viewBox="0 0 24 24" fill="none">

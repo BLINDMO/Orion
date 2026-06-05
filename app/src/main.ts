@@ -19,6 +19,7 @@ import {
   ironCondor,
 } from "../../sim/src/options/strategies.ts";
 import { Store } from "./store.ts";
+import { isLiveSymbol } from "./live.ts";
 import { Chart } from "./ui/chart.ts";
 import { drawEquityCurve, drawPayoff } from "./ui/canvas.ts";
 import * as F from "./ui/format.ts";
@@ -389,7 +390,7 @@ function renderScanBody() {
 
 // ─── Order Ticket ────────────────────────────────────────────────────────────
 function openTicket(side: Side) {
-  if (state.screen !== "trade") navigate("trade");
+  if (state.screen !== "trade") { navigate("trade"); }
   state.form.side = side;
   state.ticketOpen = true;
   const sheet = document.getElementById("ticketSheet")!;
@@ -637,6 +638,8 @@ function closePosition(key: string) {
 
 // ─── Time Controls ────────────────────────────────────────────────────────────
 function wireTime() {
+  // In live mode the real clock drives the world — manual advance is disabled.
+  if (store.live) { setAdvButtons(false); return; }
   document.querySelectorAll<HTMLElement>("[data-adv]").forEach((b) => b.onclick = () => {
     if (state.scrubbing || store.live) return;
     const kind = b.dataset.adv!;
@@ -719,7 +722,7 @@ function updateHeader() {
   }
 
   const tl = document.getElementById("timeLabel");
-  if (tl) tl.textContent = `◷ ${F.dateLabel(W().now)}`;
+  if (tl) tl.textContent = store.live ? `◷ ${F.dateLabel(W().now)} · streaming` : `◷ ${F.dateLabel(W().now)}`;
   const mp = document.getElementById("modePill");
   if (mp) {
     if (store.live) {
@@ -1188,6 +1191,38 @@ function toast(msg: string, cls = "") {
 }
 
 function ceilTo(t: number, step: number) { return Math.ceil(t / step) * step; }
+
+// Toggle the live Coinbase feed. On enable, fetch real prices, rebuild the
+// world, and re-render the trade surface; on failure, surface the reason and
+// stay in the simulator.
+async function toggleLive() {
+  if (store.live) {
+    store.disableLive();
+    store.onLiveTick = null;
+    toast("Live data off — back to simulator");
+    if (store.ui.symbol && !W().universe.has(store.ui.symbol)) store.ui.symbol = "BTC-USD";
+    renderShell();
+    return;
+  }
+  // Live streams crypto — focus a crypto symbol so the chart shows live bars.
+  if (!isLiveSymbol(store.ui.symbol)) { store.ui.symbol = "BTC-USD"; store.saveUi(); }
+  toast("Connecting to live market data…");
+  try {
+    await store.enableLive();
+    store.onLiveTick = onLiveTick;
+    renderShell();
+    toast("Live market data on", "gain");
+  } catch (e) {
+    toast("Couldn't reach live data — staying in simulator", "loss");
+    console.warn("Live data failed:", e);
+    renderSettingsScreen();
+  }
+}
+
+function onLiveTick() {
+  if (state.screen === "trade") chart.setData(visibleBars());
+  refresh();
+}
 
 function brandLogoLarge(): string {
   return `<svg class="splash-logo" width="64" height="64" viewBox="0 0 24 24" fill="none">
