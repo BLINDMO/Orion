@@ -132,6 +132,17 @@ export class BarSeries {
   rawAll(): readonly Bar[] {
     return this.bars;
   }
+
+  /** Merge live candles in-place. Newer bars are appended; the most recent bar
+   *  (still-forming) is replaced so live ticks update the last candle. */
+  appendLive(newBars: readonly Bar[]): void {
+    const incoming = [...newBars].sort((a, b) => a.t - b.t);
+    for (const b of incoming) {
+      const last = this.bars[this.bars.length - 1];
+      if (!last || b.t > last.t) this.bars.push(b);
+      else if (b.t === last.t) this.bars[this.bars.length - 1] = b;
+    }
+  }
 }
 
 /** All resolutions for a single instrument. */
@@ -166,5 +177,12 @@ export class InstrumentData {
    */
   markPrice(now: Millis): number | undefined {
     return this.finest().lastClosed(now)?.c;
+  }
+
+  /** Merge live candles into the named resolution series. */
+  appendLive(res: Resolution, bars: readonly Bar[]): void {
+    const s = this.series[res];
+    if (s) s.appendLive(bars);
+    else this.series[res] = new BarSeries(res, bars);
   }
 }

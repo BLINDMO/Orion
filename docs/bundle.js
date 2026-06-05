@@ -338,6 +338,16 @@ var BarSeries = class {
   rawAll() {
     return this.bars;
   }
+  /** Merge live candles in-place. Newer bars are appended; the most recent bar
+   *  (still-forming) is replaced so live ticks update the last candle. */
+  appendLive(newBars) {
+    const incoming = [...newBars].sort((a, b) => a.t - b.t);
+    for (const b of incoming) {
+      const last = this.bars[this.bars.length - 1];
+      if (!last || b.t > last.t) this.bars.push(b);
+      else if (b.t === last.t) this.bars[this.bars.length - 1] = b;
+    }
+  }
 };
 var InstrumentData = class {
   symbol;
@@ -365,6 +375,12 @@ var InstrumentData = class {
    */
   markPrice(now) {
     return this.finest().lastClosed(now)?.c;
+  }
+  /** Merge live candles into the named resolution series. */
+  appendLive(res, bars) {
+    const s = this.series[res];
+    if (s) s.appendLive(bars);
+    else this.series[res] = new BarSeries(res, bars);
   }
 };
 
@@ -1618,11 +1634,11 @@ function targetKey(t) {
   return t.kind === "option" && t.option ? optionKey(t.option) : t.symbol;
 }
 var DEFAULT_SETTINGS = {
-  startingCash: 25e3,
+  startingCash: 1e3,
   riskFreeRate: 0.04,
   dividendYield: 0.01,
   feeRealism: true,
-  marginMultiplier: 2,
+  marginMultiplier: 1,
   helpEnabled: true,
   maintenanceMargin: 0.25
 };
@@ -2828,8 +2844,81 @@ function getCurriculum(world) {
   return world.settings.helpEnabled ? CURRICULUM : null;
 }
 
+// src/live.ts
+var CB = "https://api.exchange.coinbase.com";
+var KR = "https://api.kraken.com";
+var KRAKEN_PAIR = {
+  "BTC-USD": "XBTUSD",
+  "ETH-USD": "ETHUSD",
+  "SOL-USD": "SOLUSD"
+};
+function resToSec(res) {
+  return res === "1m" ? 60 : res === "1h" ? 3600 : 86400;
+}
+async function fromCoinbase(symbol, res, count) {
+  const gran = resToSec(res);
+  const end = Math.floor(Date.now() / 1e3);
+  const start = end - gran * count;
+  const url = `${CB}/products/${symbol}/candles?granularity=${gran}&start=${start}&end=${end}`;
+  const r = await fetch(url, { signal: AbortSignal.timeout(8e3) });
+  if (!r.ok) throw new Error(`CB ${r.status}`);
+  const data = await r.json();
+  return data.reverse().map(([t, l, h, o, c, v]) => ({ t: t * 1e3, o, h, l, c, v }));
+}
+async function fromKraken(symbol, res, count) {
+  const interval = res === "1m" ? 1 : res === "1h" ? 60 : 1440;
+  const pair = KRAKEN_PAIR[symbol] ?? symbol;
+  const r = await fetch(`${KR}/0/public/OHLC?pair=${pair}&interval=${interval}`, {
+    signal: AbortSignal.timeout(8e3)
+  });
+  if (!r.ok) throw new Error(`KR ${r.status}`);
+  const json = await r.json();
+  if (json.error?.length) throw new Error(json.error[0]);
+  const key = Object.keys(json.result).find((k) => k !== "last");
+  const data = json.result[key];
+  return data.slice(-count).map(([t, o, h, l, c, , v]) => ({
+    t: t * 1e3,
+    o: +o,
+    h: +h,
+    l: +l,
+    c: +c,
+    v: +v
+  }));
+}
+async function fetchCandles(symbol, res, count = 300) {
+  try {
+    return await fromCoinbase(symbol, res, count);
+  } catch {
+    return fromKraken(symbol, res, count);
+  }
+}
+var LIVE_SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD"];
+
 // src/store.ts
-var KEY = "orion.session.v3";
+var PROFILES_KEY = "orion.profiles";
+function makeId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+function loadPL() {
+  try {
+    const raw = localStorage.getItem(PROFILES_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+  }
+  const id = makeId();
+  const pl = { active: id, list: [{ id, name: "Default", createdAt: Date.now() }] };
+  try {
+    localStorage.setItem(PROFILES_KEY, JSON.stringify(pl));
+  } catch {
+  }
+  return pl;
+}
+function savePL(pl) {
+  try {
+    localStorage.setItem(PROFILES_KEY, JSON.stringify(pl));
+  } catch {
+  }
+}
 var DAYS = 60;
 var HISTORY_DAYS = 25;
 var START = (() => {
@@ -2840,16 +2929,27 @@ var Store = class {
   world;
   actions = [];
   progress = new LearningProgress();
-  ui = { symbol: "BTC-USD", theme: "dark", onboarded: false };
+  ui = { symbol: "BTC-USD", theme: "dark", onboarded: false, livePref: true };
   settings;
+  profileId;
+  // Live mode state
+  live = false;
+  onLiveTick = null;
+  histWorld = null;
+  liveTimer = null;
   constructor() {
+    const pl = loadPL();
+    this.profileId = pl.active;
     const saved = this.load();
-    this.settings = saved?.settings ?? { startingCash: 25e3 };
+    this.settings = saved?.settings ?? { startingCash: 1e3 };
     if (saved) {
-      this.ui = saved.ui;
+      this.ui = { livePref: true, ...saved.ui };
       this.progress = LearningProgress.fromJSON(saved.progress);
     }
     this.build(saved);
+  }
+  get key() {
+    return `orion.session.v4.${this.profileId}`;
   }
   build(saved) {
     const data = buildSeedData(saved?.start ?? START, saved?.days ?? DAYS);
@@ -2899,10 +2999,10 @@ var Store = class {
       this.save();
     }
   }
-  // Public mutators (record + persist) -------------------------------------
+  // ── Public mutators ───────────────────────────────────────────────────────
   submit(req) {
     const r = this.world.submit(req);
-    if (r.ok) {
+    if (r.ok && !this.live) {
       this.actions.push({ k: "submit", req });
       this.save();
     }
@@ -2910,12 +3010,12 @@ var Store = class {
   }
   cancel(id) {
     const ok = this.world.cancel(id);
-    if (ok) this.record({ k: "cancel", id });
+    if (ok && !this.live) this.record({ k: "cancel", id });
     return ok;
   }
   advanceTo(to) {
     this.world.advanceTo(to, { stepRes: to - this.world.now > 2 * 864e5 ? "1h" : "1m" });
-    this.record({ k: "advance", to });
+    if (!this.live) this.record({ k: "advance", to });
   }
   deposit(amt) {
     this.world.deposit(amt);
@@ -2931,18 +3031,74 @@ var Store = class {
     this.record({ k: "settings", patch });
   }
   reset(startingCash) {
+    this.disableLive();
     this.world.reset(startingCash !== void 0 ? { startingCash } : void 0);
     this.actions = [];
     this.record({ k: "reset", startingCash });
   }
   /** Record an advance the UI already applied to the world (animated scrubbing). */
   noteAdvance(to) {
-    this.record({ k: "advance", to });
+    if (!this.live) this.record({ k: "advance", to });
   }
   record(a) {
     this.actions.push(a);
     this.save();
   }
+  // ── Live mode ─────────────────────────────────────────────────────────────
+  async enableLive() {
+    if (this.live) return;
+    const now = Date.now();
+    const liveSeedStart = now - HISTORY_DAYS * 24 * 36e5;
+    const liveData = buildSeedData(liveSeedStart, DAYS);
+    await Promise.allSettled(
+      LIVE_SYMBOLS.map(async (sym2) => {
+        try {
+          const bars = await fetchCandles(sym2, "1h", 500);
+          if (bars.length) liveData.get(sym2)?.appendLive("1h", bars);
+        } catch {
+        }
+      })
+    );
+    this.histWorld = this.world;
+    this.world = new World({
+      universe,
+      data: liveData,
+      startNow: now,
+      settings: this.settings
+    });
+    this.world.setMode("live");
+    this.live = true;
+    this.liveTimer = setInterval(() => {
+      void this.pollLive();
+    }, 3e4);
+  }
+  disableLive() {
+    if (!this.live) return;
+    if (this.liveTimer) {
+      clearInterval(this.liveTimer);
+      this.liveTimer = null;
+    }
+    if (this.histWorld) {
+      this.world = this.histWorld;
+      this.histWorld = null;
+    }
+    this.live = false;
+  }
+  async pollLive() {
+    if (!this.live) return;
+    await Promise.allSettled(
+      LIVE_SYMBOLS.map(async (sym2) => {
+        try {
+          const bars = await fetchCandles(sym2, "1h", 5);
+          if (bars.length) this.world.data.get(sym2)?.appendLive("1h", bars);
+        } catch {
+        }
+      })
+    );
+    this.world.advanceTo(Date.now(), { stepRes: "1h" });
+    this.onLiveTick?.();
+  }
+  // ── Persistence ───────────────────────────────────────────────────────────
   save() {
     const p = {
       start: START,
@@ -2953,7 +3109,7 @@ var Store = class {
       progress: this.progress.toJSON()
     };
     try {
-      localStorage.setItem(KEY, JSON.stringify(p));
+      localStorage.setItem(this.key, JSON.stringify(p));
     } catch {
     }
   }
@@ -2962,10 +3118,55 @@ var Store = class {
   }
   load() {
     try {
-      const raw = localStorage.getItem(KEY);
+      const raw = localStorage.getItem(this.key);
       return raw ? JSON.parse(raw) : null;
     } catch {
       return null;
+    }
+  }
+  // ── Profile management (static — no world access needed) ──────────────────
+  getProfileName() {
+    return loadPL().list.find((p) => p.id === this.profileId)?.name ?? "Profile";
+  }
+  static listProfiles() {
+    return loadPL().list;
+  }
+  static activeProfileId() {
+    return loadPL().active;
+  }
+  static createProfile(name) {
+    const pl = loadPL();
+    const id = makeId();
+    pl.list.push({ id, name: name.trim() || "Profile", createdAt: Date.now() });
+    pl.active = id;
+    savePL(pl);
+    return id;
+  }
+  static switchProfile(id) {
+    const pl = loadPL();
+    if (pl.list.find((p) => p.id === id)) {
+      pl.active = id;
+      savePL(pl);
+    }
+  }
+  static deleteProfile(id) {
+    const pl = loadPL();
+    if (pl.list.length <= 1) return false;
+    pl.list = pl.list.filter((p) => p.id !== id);
+    if (pl.active === id) pl.active = pl.list[0].id;
+    savePL(pl);
+    try {
+      localStorage.removeItem(`orion.session.v4.${id}`);
+    } catch {
+    }
+    return true;
+  }
+  static renameProfile(id, name) {
+    const pl = loadPL();
+    const p = pl.list.find((x) => x.id === id);
+    if (p) {
+      p.name = name.trim() || p.name;
+      savePL(pl);
     }
   }
 };
@@ -3449,10 +3650,11 @@ var state = {
   tf: "1h",
   form: { side: "buy", type: "market", qty: "", limit: "", stop: "", trail: "" },
   optExpiryIdx: 0,
-  drawerTab: "trade",
-  drawerOpen: false,
+  ticketOpen: false,
+  scanOpen: false,
   scrubbing: false,
-  learnModule: null
+  learnModule: null,
+  profileOpen: false
 };
 var ind = { sma: true, ema: true, bb: true, vwap: false };
 var W = () => store.world;
@@ -3470,6 +3672,20 @@ function boot() {
     return;
   }
   renderShell();
+  if (store.ui.livePref !== false) {
+    void store.enableLive().then(() => {
+      if (store.live) {
+        store.onLiveTick = () => {
+          chart?.setData(visibleBars());
+          updateHeader();
+        };
+        updateHeader();
+        renderNav();
+        toast("Live prices active", "gain");
+      }
+    }).catch(() => {
+    });
+  }
 }
 function renderSplash() {
   app.innerHTML = `
@@ -3479,16 +3695,27 @@ function renderSplash() {
         <h1>ORION</h1>
         <div class="splash-sub">Real charts. Your clock. An unknown future.</div>
         <button class="cta" id="begin">Enter ORION</button>
-        <div class="legal-mini">
-          Uses historical and/or delayed market data for practice trading.<br>
-          Not a brokerage. Not financial advice.
-        </div>
+        <div class="legal-mini">Uses historical and/or delayed market data for practice trading.<br>Not a brokerage. Not financial advice.</div>
       </div>
     </div>`;
   document.getElementById("begin").onclick = () => {
     store.ui.onboarded = true;
     store.saveUi();
     renderShell();
+    if (store.ui.livePref !== false) {
+      void store.enableLive().then(() => {
+        if (store.live) {
+          store.onLiveTick = () => {
+            chart?.setData(visibleBars());
+            updateHeader();
+          };
+          updateHeader();
+          renderNav();
+          toast("Live prices active", "gain");
+        }
+      }).catch(() => {
+      });
+    }
   };
 }
 function renderShell() {
@@ -3497,86 +3724,168 @@ function renderShell() {
       <div class="topbar-brand">${brandMark()}</div>
       <div class="topbar-syms" id="topbarSyms"></div>
       <div class="topbar-price" id="topbarPrice"></div>
-      <div class="topbar-acct" id="topbarAcct"></div>
+      <div class="topbar-right">
+        <div class="topbar-acct" id="topbarAcct"></div>
+        <button class="profile-btn" id="profileBtn" aria-label="Profile">
+          <div class="profile-avatar" id="profileAvatar">${store.getProfileName()[0]?.toUpperCase() ?? "P"}</div>
+        </button>
+      </div>
     </div>
     <div class="workspace">
       <nav class="sidebar" id="sidebar"></nav>
-      <main class="content">
-        <div class="trade-view">
-          <div class="chart-area">
-            <div class="chart-toolbar" id="chartToolbar"></div>
-            <div class="quickbar">
-              <div class="qb-funds">
-                <span class="qb-k">Available</span>
-                <span class="qb-v num" id="qbBp">\u2014</span>
-              </div>
-              <div class="qb-funds qb-eq">
-                <span class="qb-k">Equity</span>
-                <span class="qb-v num" id="qbEq">\u2014</span>
-              </div>
-              <div class="qb-actions">
-                <button class="qb-btn buy" id="qbBuy">Buy</button>
-                <button class="qb-btn sell" id="qbSell">Sell</button>
-              </div>
-            </div>
-            <div class="chart-wrap"><canvas id="chart"></canvas></div>
-            <div class="timebar">
-              <span class="time-label" id="timeLabel"></span>
-              <span class="mode-pill" id="modePill"></span>
-              <button class="adv-btn" data-adv="h">+1H</button>
-              <button class="adv-btn" data-adv="d">+1D</button>
-              <button class="adv-btn" data-adv="m">+30D</button>
-            </div>
-          </div>
-          <aside class="drawer" id="drawer">
-            <div class="drawer-header">
-              <div class="drawer-tabs" id="drawerTabs"></div>
-              <button class="drawer-close" id="drawerClose">\u2715</button>
-            </div>
-            <div class="drawer-body" id="drawerBody"></div>
-          </aside>
-        </div>
-        <div id="overlay"></div>
+      <main class="content" id="content">
+        ${tradeViewHTML()}
+        <div class="screen-overlay" id="overlay"></div>
       </main>
     </div>
+    <div class="bottom-nav" id="bottomNav"></div>
+    <div class="profile-panel" id="profilePanel"></div>
+    <div class="panel-backdrop" id="panelBackdrop"></div>
     <div class="toast" id="toast"></div>`;
   chart = new Chart(document.getElementById("chart"));
   chart.setData(visibleBars(), { resetView: true });
   applyIndicators();
-  renderSidebar();
+  renderNav();
   renderSymbolTabs();
   renderChartToolbar();
-  renderDrawerTabs();
-  renderDrawerBody();
   wireTime();
-  wireDrawerClose();
   document.getElementById("qbBuy").onclick = () => openTicket("buy");
   document.getElementById("qbSell").onclick = () => openTicket("sell");
+  document.getElementById("termBtn")?.addEventListener("click", toggleScan);
+  document.getElementById("scanClose")?.addEventListener("click", toggleScan);
+  document.getElementById("ticketClose").onclick = closeTicket;
+  document.getElementById("profileBtn").onclick = openProfile;
+  document.getElementById("panelBackdrop").onclick = closeAllPanels;
+  store.onLiveTick = () => {
+    chart?.setData(visibleBars());
+    updateHeader();
+  };
   if (state.screen !== "trade") mountScreen(state.screen);
   refresh();
 }
-function renderSidebar() {
-  const sidebar = document.getElementById("sidebar");
+function tradeViewHTML() {
+  return `<div class="trade-view" id="tradeView">
+    <div class="chart-area">
+      <div class="chart-toolbar" id="chartToolbar"></div>
+      <div class="quickbar">
+        <div class="qb-funds">
+          <span class="qb-k">Cash</span>
+          <span class="qb-v num" id="qbBp">\u2014</span>
+        </div>
+        <div class="qb-funds qb-eq">
+          <span class="qb-k">Equity</span>
+          <span class="qb-v num" id="qbEq">\u2014</span>
+        </div>
+        <div class="qb-actions">
+          <button class="qb-btn buy" id="qbBuy">Buy</button>
+          <button class="qb-btn sell" id="qbSell">Sell</button>
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="chart"></canvas></div>
+      <div class="timebar">
+        <span class="time-label" id="timeLabel"></span>
+        <span class="mode-pill" id="modePill"></span>
+        <button class="adv-btn" data-adv="h">+1H</button>
+        <button class="adv-btn" data-adv="d">+1D</button>
+        <button class="adv-btn" data-adv="m">+30D</button>
+      </div>
+    </div>
+    <!-- Scan panel: slides in from right on desktop, up from bottom on mobile -->
+    <div class="scan-panel-wrap" id="scanWrap">
+      <div class="scan-panel-inner">
+        <div class="scan-panel-head">
+          <span>\u25C8 TERMINAL</span>
+          <button class="icon-btn" id="scanClose">\u2715</button>
+        </div>
+        <div class="scan-panel-body" id="scanBody"></div>
+      </div>
+    </div>
+  </div>
+  <!-- Order ticket: full-screen sheet on mobile, sidebar on desktop -->
+  <div class="ticket-sheet" id="ticketSheet">
+    <div class="ticket-head">
+      <span class="ticket-title">Order \u2014 <span id="ticketSym"></span></span>
+      <button class="icon-btn" id="ticketClose">\u2715</button>
+    </div>
+    <div class="ticket-body" id="ticketBody"></div>
+  </div>`;
+}
+function navItems() {
   const showLearn = W().settings.helpEnabled;
   const items = [
-    ["trade", "Trade", tradeIcon()],
-    ["options", "Options", optionsIcon()],
-    ["stats", "Statistics", statsIcon()]
+    ["trade", "Chart", tradeIcon],
+    ["book", "Book", bookIcon],
+    ["options", "Options", optionsIcon],
+    ["stats", "Stats", statsIcon]
   ];
-  if (showLearn) items.push(["learn", "Learn", learnIcon()]);
-  sidebar.innerHTML = `
-    ${items.map(([s, tip, icon]) => `
-      <button class="nav-btn ${state.screen === s ? "active" : ""}" data-nav="${s}" aria-label="${tip}">
-        ${icon}
-        <span class="nav-tip">${tip}</span>
-      </button>`).join("")}
-    <div class="sidebar-sep"></div>
-    <div class="sidebar-spacer"></div>
-    <button class="nav-btn ${state.screen === "settings" ? "active" : ""}" data-nav="settings" aria-label="Settings">
-      ${settingsIcon()}
-      <span class="nav-tip">Settings</span>
-    </button>`;
+  if (showLearn) items.push(["learn", "Learn", learnIcon]);
+  items.push(["settings", "Settings", settingsIcon]);
+  return items;
+}
+function renderNav() {
+  renderSidebar();
+  renderBottomNav();
+}
+function renderSidebar() {
+  const sidebar = document.getElementById("sidebar");
+  if (!sidebar) return;
+  const items = navItems();
+  sidebar.innerHTML = items.map(([s, tip, icon]) => `
+    <button class="nav-btn ${state.screen === s ? "active" : ""}" data-nav="${s}" aria-label="${tip}">
+      ${icon()}
+      <span class="nav-tip">${tip}</span>
+    </button>`).join("") + `<div class="sidebar-spacer"></div>`;
   sidebar.querySelectorAll("[data-nav]").forEach((b) => b.onclick = () => navigate(b.dataset.nav));
+}
+function renderBottomNav() {
+  const bn = document.getElementById("bottomNav");
+  if (!bn) return;
+  const items = navItems().slice(0, 5);
+  bn.innerHTML = items.map(([s, tip, icon]) => `
+    <button class="bn-btn ${state.screen === s ? "active" : ""}" data-nav="${s}">
+      ${icon()}
+      <span class="bn-label">${tip}</span>
+    </button>`).join("");
+  bn.querySelectorAll("[data-nav]").forEach((b) => b.onclick = () => navigate(b.dataset.nav));
+}
+function navigate(s) {
+  if (s !== "trade") {
+    closeTicket();
+    closeScan();
+  }
+  state.screen = s;
+  if (s === "trade") {
+    document.getElementById("overlay").innerHTML = "";
+    chart?.setData(visibleBars());
+    renderNav();
+    refresh();
+    return;
+  }
+  renderNav();
+  mountScreen(s);
+}
+function mountScreen(s) {
+  if (s === "book") renderBookScreen();
+  else if (s === "options") renderOptionsScreen();
+  else if (s === "stats") renderStatsScreen();
+  else if (s === "learn") renderLearnScreen();
+  else if (s === "settings") renderSettingsScreen();
+}
+function closeScreen() {
+  navigate("trade");
+}
+function screenShell(title, body, extraHead = "") {
+  return `<div class="screen">
+    <div class="shead">
+      <button class="back" id="backBtn">\u2039</button>
+      <h2>${title}</h2>
+      ${extraHead}
+    </div>
+    <div class="sbody" id="sbody">${body}</div>
+  </div>`;
+}
+function overlayEl() {
+  return document.getElementById("overlay");
 }
 function renderSymbolTabs() {
   const wrap = document.getElementById("topbarSyms");
@@ -3598,6 +3907,7 @@ function renderSymbolTabs() {
     renderSymbolTabs();
     renderChartToolbar();
     chart.setData(visibleBars(), { resetView: true });
+    document.getElementById("ticketSym").textContent = sym().replace("-USD", "");
     refresh();
   });
 }
@@ -3605,7 +3915,7 @@ function renderChartToolbar() {
   const toolbar = document.getElementById("chartToolbar");
   if (!toolbar) return;
   const tfs = ["1m", "1h", "1d"];
-  const inds = [["bb", "BB"], ["sma", "SMA 50"], ["ema", "EMA 20"], ["vwap", "VWAP"]];
+  const inds = [["bb", "BB"], ["sma", "SMA"], ["ema", "EMA"], ["vwap", "VWAP"]];
   toolbar.innerHTML = `
     <div class="toolbar-group">
       ${tfs.map((t) => `<button class="toolbar-btn ${state.tf === t ? "active" : ""}" data-tf="${t}">${t.toUpperCase()}</button>`).join("")}
@@ -3627,108 +3937,112 @@ function renderChartToolbar() {
     renderChartToolbar();
     applyIndicators();
   });
-  document.getElementById("termBtn").onclick = openScanTab;
+  document.getElementById("termBtn")?.addEventListener("click", toggleScan);
 }
 function applyIndicators() {
   if (!chart) return;
   chart.setConfig({ sma: ind.sma ? [50] : [], ema: ind.ema ? [20] : [], bollinger: ind.bb, vwap: ind.vwap });
 }
-function renderDrawerTabs() {
-  const tabs = document.getElementById("drawerTabs");
-  if (!tabs) return;
-  const list = [
-    { id: "trade", label: "Trade" },
-    { id: "scan", label: "\u25C8 Scan" },
-    { id: "book", label: "Book" }
-  ];
-  tabs.innerHTML = list.map(
-    (t) => `<button class="drawer-tab ${state.drawerTab === t.id ? "active" : ""}" data-tab="${t.id}">${t.label}</button>`
-  ).join("");
-  tabs.querySelectorAll("[data-tab]").forEach((b) => b.onclick = () => {
-    state.drawerTab = b.dataset.tab;
-    renderDrawerTabs();
-    renderDrawerBody();
-  });
-}
-function renderDrawerBody() {
-  const body = document.getElementById("drawerBody");
-  if (!body) return;
-  if (state.drawerTab === "trade") {
-    body.innerHTML = ticketHTML();
-    wireTicket();
-    updatePreview();
-  } else if (state.drawerTab === "scan") {
-    body.innerHTML = scanHTML();
+function toggleScan() {
+  state.scanOpen = !state.scanOpen;
+  const wrap = document.getElementById("scanWrap");
+  if (state.scanOpen) {
+    wrap.classList.add("open");
+    renderScanBody();
   } else {
-    body.innerHTML = bookHTML();
-    wireBook();
+    wrap.classList.remove("open");
   }
 }
-function openScanTab() {
-  state.drawerTab = "scan";
-  state.drawerOpen = true;
-  document.getElementById("drawer").classList.add("open");
-  renderDrawerTabs();
-  renderDrawerBody();
+function closeScan() {
+  state.scanOpen = false;
+  document.getElementById("scanWrap")?.classList.remove("open");
+}
+function renderScanBody() {
+  const body = document.getElementById("scanBody");
+  if (!body) return;
+  const s = scan(W(), sym(), state.tf);
+  const help = W().settings.helpEnabled;
+  body.innerHTML = `
+    <div class="scan-meta">\u25C8 ${sym()} \xB7 ${s.timeframe}</div>
+    <div class="badges">
+      <span class="badge ${s.trend === "up" ? "up" : s.trend === "down" ? "down" : ""}">Trend: ${s.trend}</span>
+      <span class="badge">Momentum: ${s.momentum}</span>
+      <span class="badge">Vol: ${s.volatility}</span>
+    </div>
+    ${s.readings.filter((r) => r.value !== void 0).slice(0, 7).map((r) => `
+      <div class="reading">
+        <span class="muted">${r.indicator}</span>
+        <span class="num">${typeof r.value === "number" ? Math.abs(r.value) > 100 ? compact(r.value) : r.value.toFixed(2) : "\u2014"} <span class="dim">${r.state}</span></span>
+      </div>`).join("")}
+    ${help ? s.callouts.slice(0, 4).map((c) => `
+      <div class="callout ${c.severity}">
+        <div class="t">${c.title}</div>
+        <div class="d">${c.detail}</div>
+      </div>`).join("") : ""}`;
 }
 function openTicket(side) {
   if (state.screen !== "trade") navigate("trade");
   state.form.side = side;
-  state.drawerTab = "trade";
-  state.drawerOpen = true;
-  document.getElementById("drawer").classList.add("open");
-  renderDrawerTabs();
-  renderDrawerBody();
-  const q = document.getElementById("qty");
-  if (q) {
-    q.focus();
-    q.select();
-  }
+  state.ticketOpen = true;
+  const sheet = document.getElementById("ticketSheet");
+  sheet.classList.add("open");
+  document.getElementById("ticketSym").textContent = sym().replace("-USD", "");
+  renderTicketBody();
+  setTimeout(() => {
+    const q = document.getElementById("qty");
+    if (q) {
+      q.focus();
+      q.select();
+    }
+  }, 50);
 }
-function wireDrawerClose() {
-  document.getElementById("drawerClose").onclick = () => {
-    state.drawerOpen = false;
-    document.getElementById("drawer").classList.remove("open");
-  };
+function closeTicket() {
+  state.ticketOpen = false;
+  document.getElementById("ticketSheet")?.classList.remove("open");
 }
-function ticketHTML() {
+function renderTicketBody() {
+  const body = document.getElementById("ticketBody");
+  if (!body) return;
   const i = inst();
-  return `<div class="ticket">
-    <div class="seg ${state.form.side}" id="sideSeg">
-      <button data-side="buy" class="${state.form.side === "buy" ? "on" : ""}">Buy</button>
-      <button data-side="sell" class="${state.form.side === "sell" ? "on" : ""}">Sell</button>
-    </div>
-    <div class="field"><label>Order type</label>
-      <select class="input" id="typeSel">
-        ${["market", "limit", "stop", "stop-limit", "trailing-stop"].map(
+  body.innerHTML = `
+    <div class="ticket">
+      <div class="seg ${state.form.side}" id="sideSeg">
+        <button data-side="buy" class="${state.form.side === "buy" ? "on" : ""}">Buy</button>
+        <button data-side="sell" class="${state.form.side === "sell" ? "on" : ""}">Sell</button>
+      </div>
+      <div class="field"><label>Order type</label>
+        <select class="input" id="typeSel">
+          ${["market", "limit", "stop", "stop-limit", "trailing-stop"].map(
     (t) => `<option value="${t}" ${t === state.form.type ? "selected" : ""}>${t}</option>`
   ).join("")}
-      </select></div>
-    <div class="field"><label>Quantity (${i.assetClass === "crypto" ? "units" : "shares"})</label>
-      <input class="input num" id="qty" inputmode="decimal" placeholder="0" value="${state.form.qty}"></div>
-    <div class="field ${["limit", "stop-limit"].includes(state.form.type) ? "" : "hidden"}" id="limitField">
-      <label>Limit price</label>
-      <input class="input num" id="limit" inputmode="decimal" value="${state.form.limit}"></div>
-    <div class="field ${["stop", "stop-limit"].includes(state.form.type) ? "" : "hidden"}" id="stopField">
-      <label>Stop price</label>
-      <input class="input num" id="stop" inputmode="decimal" value="${state.form.stop}"></div>
-    <div class="field ${state.form.type === "trailing-stop" ? "" : "hidden"}" id="trailField">
-      <label>Trail %</label>
-      <input class="input num" id="trail" inputmode="decimal" placeholder="5" value="${state.form.trail}"></div>
-    <div class="preview" id="preview"></div>
-    <button class="submit ${state.form.side}" id="submitBtn"></button>
-    <div class="note" id="note"></div>
-  </div>`;
+        </select></div>
+      <div class="field"><label>Qty (${i.assetClass === "crypto" ? "units" : "shares"})</label>
+        <input class="input num" id="qty" inputmode="decimal" placeholder="0" value="${state.form.qty}"></div>
+      <div class="field ${["limit", "stop-limit"].includes(state.form.type) ? "" : "hidden"}" id="limitField">
+        <label>Limit price</label>
+        <input class="input num" id="limit" inputmode="decimal" value="${state.form.limit}"></div>
+      <div class="field ${["stop", "stop-limit"].includes(state.form.type) ? "" : "hidden"}" id="stopField">
+        <label>Stop price</label>
+        <input class="input num" id="stop" inputmode="decimal" value="${state.form.stop}"></div>
+      <div class="field ${state.form.type === "trailing-stop" ? "" : "hidden"}" id="trailField">
+        <label>Trail %</label>
+        <input class="input num" id="trail" inputmode="decimal" placeholder="5" value="${state.form.trail}"></div>
+      <div class="preview" id="preview"></div>
+      <button class="submit ${state.form.side}" id="submitBtn"></button>
+      <div class="note" id="note"></div>
+    </div>`;
+  wireTicket();
+  updatePreview();
 }
 function wireTicket() {
   document.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => {
     state.form.side = b.dataset.side;
-    renderDrawerBody();
+    renderTicketBody();
   });
   const typeSel = document.getElementById("typeSel");
   if (typeSel) typeSel.onchange = () => {
     state.form.type = typeSel.value;
-    renderDrawerBody();
+    renderTicketBody();
   };
   for (const id of ["qty", "limit", "stop", "trail"]) {
     const e = document.getElementById(id);
@@ -3761,15 +4075,14 @@ function updatePreview() {
   const qty2 = parseFloat(state.form.qty) || 0;
   const notional = (estPrice ?? 0) * qty2;
   const fee = inst().fees.takerBps / 1e4 * notional;
-  const bp = W().buyingPower().toNumber();
-  const after = state.form.side === "buy" ? bp - notional - fee : bp;
+  const cash = W().portfolio.cash.toNumber();
+  const after = state.form.side === "buy" ? cash - notional - fee : cash + notional - fee;
   const preview = document.getElementById("preview");
   if (preview) preview.innerHTML = `
     <div class="row"><span class="k">Est. price</span><span class="num">${estPrice ? priceFmt(estPrice) : "\u2014"}</span></div>
     <div class="row"><span class="k">Notional</span><span class="num">${money(notional)}</span></div>
-    <div class="row"><span class="k">Est. fee</span><span class="num">${money(fee)}</span></div>
-    <div class="row"><span class="k">Buying power</span><span class="num">${money(bp)}</span></div>
-    <div class="row"><span class="k">After trade</span><span class="num ${after < 0 ? "loss" : ""}">${money(after)}</span></div>`;
+    <div class="row"><span class="k">Fee</span><span class="num">${money(fee)}</span></div>
+    <div class="row"><span class="k">Cash after</span><span class="num ${after < 0 ? "loss" : ""}">${money(after)}</span></div>`;
   const btn = document.getElementById("submitBtn");
   if (btn) {
     btn.className = `submit ${state.form.side}`;
@@ -3791,91 +4104,104 @@ function doSubmit() {
   }
   note.textContent = "";
   state.form.qty = "";
+  closeTicket();
   if (W().mode === "live") toast("Order filled", "gain");
-  else toast(req.type === "market" ? "Market order placed \u2014 fills next bar" : "Order working");
-  renderDrawerBody();
+  else toast(req.type === "market" ? "Order placed \u2014 fills next bar" : "Order working");
   refresh();
+  if (state.screen === "book") renderBookScreen();
 }
-function scanHTML() {
-  const s = scan(W(), sym(), state.tf);
-  const help = W().settings.helpEnabled;
-  return `<div class="scan-panel">
-    <div class="scan-head">\u25C8 TERMINAL \u2014 ${sym()} ${s.timeframe}</div>
-    <div class="badges">
-      <span class="badge ${s.trend === "up" ? "up" : s.trend === "down" ? "down" : ""}">Trend: ${s.trend}</span>
-      <span class="badge">Momentum: ${s.momentum}</span>
-      <span class="badge">Vol: ${s.volatility}</span>
-    </div>
-    ${s.readings.filter((r) => r.value !== void 0).slice(0, 7).map((r) => `
-      <div class="reading">
-        <span class="muted">${r.indicator}</span>
-        <span class="num">${typeof r.value === "number" ? Math.abs(r.value) > 100 ? compact(r.value) : r.value.toFixed(2) : "\u2014"} <span class="dim">${r.state}</span></span>
-      </div>`).join("")}
-    ${help ? s.callouts.slice(0, 4).map((c) => `
-        <div class="callout ${c.severity}">
-          <div class="t">${c.title}</div>
-          <div class="d">${c.detail}</div>
-          <div class="lesson">\u21AA Lesson: ${c.lessonId}</div>
-        </div>`).join("") : `<div class="empty mt">Help is off \u2014 pure analysis mode. Enable Help in Settings for plain-English commentary.</div>`}
-  </div>`;
-}
-function bookHTML() {
+function renderBookScreen() {
+  const overlay = overlayEl();
   const resolve = W().markResolver();
-  const pos = [...W().portfolio.positions.values()];
+  const positions = [...W().portfolio.positions.values()];
   const wo = W().workingOrders();
-  const fills = W().fills.slice(-8).reverse();
-  const posHTML = pos.length === 0 ? `<div class="empty">No open positions.</div>` : pos.map((p) => {
+  const fills = W().fills.slice(-12).reverse();
+  const posHTML = positions.length === 0 ? `<div class="empty">No open positions.</div>` : positions.map((p) => {
     const mark = resolve(p)?.toNumber() ?? 0;
-    const upnl = W().portfolio.unrealized(p, resolve).toNumber();
-    const label = p.target.kind === "option" && p.option ? `${p.option.underlying.replace("-USD", "")} ${p.option.strike}${p.option.right[0].toUpperCase()}` : p.target.symbol.replace("-USD", "");
-    return `<div class="li">
-          <div>
-            <div class="sym">${label}</div>
-            <div class="sub-text">${qty(p.qty)} @ ${priceFmt(p.avgCost.toNumber())}</div>
+    const upnl2 = W().portfolio.unrealized(p, resolve).toNumber();
+    const isOpt = p.target.kind === "option" && p.option;
+    const label = isOpt ? `${p.option.underlying.replace("-USD", "")} ${p.option.strike}${p.option.right[0].toUpperCase()} ${dayLabel(p.option.expiry)}` : p.target.symbol.replace("-USD", "");
+    const subLabel = isOpt ? `${p.qty > 0 ? "Long" : "Short"} ${Math.abs(p.qty)} contract${Math.abs(p.qty) !== 1 ? "s" : ""}` : `${qty(p.qty)} @ ${priceFmt(p.avgCost.toNumber())}`;
+    return `<div class="book-row">
+          <div class="book-row-info">
+            <div class="book-sym">${label}</div>
+            <div class="sub-text">${subLabel}</div>
           </div>
-          <div class="right">
-            <div class="price">${priceFmt(mark)}</div>
-            <div class="pnl ${pnlClass(upnl)}">${glyph(upnl)} ${money(upnl, { sign: true })}</div>
+          <div class="book-row-pnl">
+            <div class="book-mark">${priceFmt(mark)}</div>
+            <div class="pnl ${pnlClass(upnl2)}">${glyph(upnl2)} ${money(upnl2, { sign: true })}</div>
           </div>
-          <button class="x" data-close="${p.key}">\u2297</button>
+          <div class="book-row-actions">
+            <button class="action-btn close-btn" data-close="${p.key}">Close</button>
+          </div>
         </div>`;
   }).join("");
-  const ordersHTML = wo.length === 0 ? `<div class="empty">No working orders.</div>` : wo.map((o) => `<div class="li">
-        <div>
-          <div class="sym">${o.side.toUpperCase()} ${qty(o.qty - o.filledQty)} ${(o.target.option?.underlying ?? o.target.symbol).replace("-USD", "")}</div>
+  const ordersHTML = wo.length === 0 ? `<div class="empty">No working orders.</div>` : wo.map((o) => `<div class="book-row">
+        <div class="book-row-info">
+          <div class="book-sym">${o.side.toUpperCase()} ${qty(o.qty - o.filledQty)} ${(o.target.option?.underlying ?? o.target.symbol).replace("-USD", "")}</div>
           <div class="sub-text">${o.type}${o.limitPrice ? " @ " + priceFmt(o.limitPrice) : ""}${o.stopPrice ? " stop " + priceFmt(o.stopPrice) : ""}</div>
         </div>
-        <button class="x" data-cancel="${o.id}">\u2715</button>
-      </div>`).join("");
-  const blotterHTML = fills.length === 0 ? `<div class="empty">No fills yet.</div>` : fills.map((f) => `<div class="li">
-        <div>
-          <div class="sym">${f.side.toUpperCase()} ${qty(f.qty)} ${(f.target.option?.underlying ?? f.target.symbol).replace("-USD", "")}</div>
-          <div class="sub-text num">${dateLabel(f.at)}</div>
+        <div class="book-row-actions">
+          <button class="action-btn cancel-btn" data-cancel="${o.id}">Cancel</button>
         </div>
-        <div class="right">
-          <div class="price">${priceFmt(f.price.toNumber())}</div>
+      </div>`).join("");
+  const blotterHTML = fills.length === 0 ? `<div class="empty">No fills yet.</div>` : fills.map((f) => `<div class="book-row">
+        <div class="book-row-info">
+          <div class="book-sym">${f.side.toUpperCase()} ${qty(f.qty)} ${(f.target.option?.underlying ?? f.target.symbol).replace("-USD", "")}</div>
+          <div class="sub-text">${dateLabel(f.at)}</div>
+        </div>
+        <div class="book-row-pnl">
+          <div class="book-mark">${priceFmt(f.price.toNumber())}</div>
           ${!f.realized.isZero() ? `<div class="pnl ${pnlClass(f.realized.toNumber())}">${money(f.realized.toNumber(), { sign: true })}</div>` : `<div class="pnl dim">fee ${money(f.fee.toNumber())}</div>`}
         </div>
       </div>`).join("");
-  return `
+  const eq = W().equity().toNumber();
+  const cash = W().portfolio.cash.toNumber();
+  const upnl = W().unrealized().toNumber();
+  const totalPnl = eq - W().settings.startingCash;
+  const summaryHTML = `
+    <div class="port-summary">
+      <div class="port-stat">
+        <div class="ps-k">Equity</div>
+        <div class="ps-v num">${money(eq)}</div>
+      </div>
+      <div class="port-stat">
+        <div class="ps-k">Cash</div>
+        <div class="ps-v num">${money(cash)}</div>
+      </div>
+      <div class="port-stat">
+        <div class="ps-k">Unrealized</div>
+        <div class="ps-v num ${pnlClass(upnl)}">${money(upnl, { sign: true })}</div>
+      </div>
+      <div class="port-stat">
+        <div class="ps-k">Total P&amp;L</div>
+        <div class="ps-v num ${pnlClass(totalPnl)}">${money(totalPnl, { sign: true })}</div>
+      </div>
+    </div>`;
+  const body = `
+    ${summaryHTML}
     <div class="book-section">
-      <div class="book-head">Positions</div>
+      <div class="book-head">Positions <span class="count-badge">${positions.length}</span></div>
       <div id="positions">${posHTML}</div>
     </div>
     <div class="book-section">
-      <div class="book-head">Working Orders</div>
+      <div class="book-head">Working Orders <span class="count-badge">${wo.length}</span></div>
       <div id="orders">${ordersHTML}</div>
     </div>
     <div class="book-section">
       <div class="book-head">Recent Fills</div>
       <div id="blotter">${blotterHTML}</div>
     </div>`;
-}
-function wireBook() {
-  document.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => closePosition(b.dataset.close));
-  document.querySelectorAll("[data-cancel]").forEach((b) => b.onclick = () => {
+  overlay.innerHTML = screenShell("Portfolio", body);
+  document.getElementById("backBtn").onclick = closeScreen;
+  overlay.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => {
+    closePosition(b.dataset.close);
+    renderBookScreen();
+  });
+  overlay.querySelectorAll("[data-cancel]").forEach((b) => b.onclick = () => {
     store.cancel(b.dataset.cancel);
     refresh();
+    renderBookScreen();
   });
 }
 function closePosition(key) {
@@ -3889,7 +4215,7 @@ function closePosition(key) {
 }
 function wireTime() {
   document.querySelectorAll("[data-adv]").forEach((b) => b.onclick = () => {
-    if (state.scrubbing) return;
+    if (state.scrubbing || store.live) return;
     const kind = b.dataset.adv;
     const from = W().now;
     let target = from;
@@ -3906,8 +4232,8 @@ function animateAdvance(from, target) {
   const span = target - from;
   const stepRes = span > 2 * 864e5 ? "1h" : "1m";
   const barMs = stepRes === "1h" ? 36e5 : 6e4;
-  const maxBarsPerFrame = 18;
-  const dur = 750;
+  const maxBarsPerFrame = 24;
+  const dur = 800;
   const t0 = performance.now();
   const ease = (k) => k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
   function frame(now) {
@@ -3916,7 +4242,7 @@ function animateAdvance(from, target) {
     const cap = W().now + maxBarsPerFrame * barMs;
     if (want > cap) want = cap;
     if (want > W().now) W().advanceTo(want, { stepRes });
-    chart.setData(visibleBars());
+    chart?.setData(visibleBars());
     updateHeader();
     if (W().now < target) requestAnimationFrame(frame);
     else finishAdvance(target);
@@ -3929,7 +4255,7 @@ function finishAdvance(target) {
   state.scrubbing = false;
   app.classList.remove("scrubbing");
   setAdvButtons(true);
-  chart.setData(visibleBars());
+  chart?.setData(visibleBars());
   refresh();
   toast(`Advanced to ${dayLabel(W().now)}`);
 }
@@ -3947,83 +4273,97 @@ function updateHeader() {
       <div class="px num">${priceFmt(last.c)}</div>
       <div class="chg num ${pnlClass(chg)}">${glyph(chg)} ${pct(chg)}</div>`;
   }
+  const cash = W().portfolio.cash.toNumber();
   const eq = W().equity().toNumber();
-  const bp = W().buyingPower().toNumber();
   const qbBp = document.getElementById("qbBp");
-  if (qbBp) qbBp.textContent = money(bp);
+  if (qbBp) qbBp.textContent = money(cash);
   const qbEq = document.getElementById("qbEq");
   if (qbEq) qbEq.textContent = money(eq);
   const acctEl = document.getElementById("topbarAcct");
   if (acctEl) {
-    const upnl = W().unrealized().toNumber();
     const totalPnl = eq - W().settings.startingCash;
     acctEl.innerHTML = `
+      <div class="acct-item"><span class="k">Cash</span><span class="v num">${money(cash)}</span></div>
       <div class="acct-item"><span class="k">Equity</span><span class="v num">${money(eq)}</span></div>
-      <div class="acct-item"><span class="k">Buying Power</span><span class="v num">${money(bp)}</span></div>
-      <div class="acct-item"><span class="k">Unrealized</span><span class="v num ${pnlClass(upnl)}">${money(upnl, { sign: true })}</span></div>
-      <div class="acct-item"><span class="k">Total P&amp;L</span><span class="v num ${pnlClass(totalPnl)}">${money(totalPnl, { sign: true })}</span></div>`;
+      <div class="acct-item"><span class="k">P&amp;L</span><span class="v num ${pnlClass(totalPnl)}">${money(totalPnl, { sign: true })}</span></div>`;
   }
   const tl = document.getElementById("timeLabel");
   if (tl) tl.textContent = `\u25F7 ${dateLabel(W().now)}`;
   const mp = document.getElementById("modePill");
   if (mp) {
-    mp.textContent = W().mode === "live" ? "LIVE" : "";
-    mp.className = `mode-pill ${W().mode === "live" ? "live" : ""}`;
-    mp.style.display = W().mode === "live" ? "" : "none";
+    if (store.live) {
+      mp.textContent = "\u25CF LIVE";
+      mp.className = "mode-pill live";
+      mp.style.display = "";
+    } else {
+      mp.textContent = "";
+      mp.className = "mode-pill";
+      mp.style.display = "none";
+    }
   }
 }
 function refresh() {
   updateHeader();
   renderSymbolTabs();
-  if (state.drawerTab === "scan") {
-    const body = document.getElementById("drawerBody");
-    if (body) body.innerHTML = scanHTML();
-  } else if (state.drawerTab === "book") {
-    const body = document.getElementById("drawerBody");
-    if (body) {
-      body.innerHTML = bookHTML();
-      wireBook();
-    }
-  } else {
-    updatePreview();
-  }
+  if (state.screen === "book") renderBookScreen();
 }
-function navigate(s) {
-  state.screen = s;
-  if (s === "trade") {
-    document.getElementById("overlay").innerHTML = "";
-    if (window.innerWidth <= 900) {
-      state.drawerOpen = true;
-      document.getElementById("drawer").classList.add("open");
-    }
-    chart.setData(visibleBars());
-    renderSidebar();
-    refresh();
-    return;
-  }
-  mountScreen(s);
-  renderSidebar();
+function openProfile() {
+  state.profileOpen = true;
+  const panel = document.getElementById("profilePanel");
+  const backdrop = document.getElementById("panelBackdrop");
+  renderProfilePanel();
+  panel.classList.add("open");
+  backdrop.classList.add("show");
 }
-function mountScreen(s) {
-  if (s === "options") renderOptionsScreen();
-  else if (s === "stats") renderStatsScreen();
-  else if (s === "learn") renderLearnScreen();
-  else if (s === "settings") renderSettingsScreen();
+function closeAllPanels() {
+  state.profileOpen = false;
+  document.getElementById("profilePanel")?.classList.remove("open");
+  document.getElementById("panelBackdrop")?.classList.remove("show");
 }
-function closeScreen() {
-  navigate("trade");
-}
-function screenShell(title, body) {
-  return `<div class="screen">
-    <div class="shead">
-      <button class="back" id="backBtn">\u2039 Back</button>
-      <h2>${title}</h2>
+function renderProfilePanel() {
+  const panel = document.getElementById("profilePanel");
+  const profiles = Store.listProfiles();
+  const activeId = store.profileId;
+  panel.innerHTML = `
+    <div class="pp-header">
+      <span class="pp-title">Profiles</span>
+      <button class="icon-btn" id="ppClose">\u2715</button>
     </div>
-    <div class="sbody">${body}</div>
-  </div>`;
-}
-function overlayEl() {
-  return document.getElementById("overlay");
+    <div class="pp-list">
+      ${profiles.map((p) => `
+        <div class="pp-item ${p.id === activeId ? "active" : ""}">
+          <div class="pp-avatar">${p.name[0]?.toUpperCase()}</div>
+          <div class="pp-info">
+            <div class="pp-name">${p.name}</div>
+            ${p.id === activeId ? `<div class="pp-sub">Active</div>` : ""}
+          </div>
+          ${p.id !== activeId ? `<button class="pp-switch" data-switch="${p.id}">Switch</button>` : ""}
+          ${profiles.length > 1 ? `<button class="pp-del" data-del="${p.id}" title="Delete">\u2715</button>` : ""}
+        </div>`).join("")}
+    </div>
+    <button class="pp-create" id="ppCreate">+ New Profile</button>`;
+  document.getElementById("ppClose").onclick = closeAllPanels;
+  panel.querySelectorAll("[data-switch]").forEach((b) => b.onclick = () => {
+    Store.switchProfile(b.dataset.switch);
+    window.location.reload();
+  });
+  panel.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => {
+    if (confirm("Delete this profile? All its data will be lost.")) {
+      Store.deleteProfile(b.dataset.del);
+      if (b.dataset.del === activeId) {
+        window.location.reload();
+        return;
+      }
+      renderProfilePanel();
+    }
+  });
+  document.getElementById("ppCreate").onclick = () => {
+    const name = prompt("Profile name:", "New Profile");
+    if (name) {
+      Store.createProfile(name);
+      window.location.reload();
+    }
+  };
 }
 function chainParams() {
   const spot = W().market.spotMark(sym(), W().now).toNumber();
@@ -4045,6 +4385,9 @@ function renderOptionsScreen() {
   const chain = buildChain(p, { strikes: 7 });
   state.optExpiryIdx = Math.min(state.optExpiryIdx, chain.expiries.length - 1);
   const exp = chain.expiries[state.optExpiryIdx];
+  const positions = [...W().portfolio.positions.values()].filter(
+    (pos) => pos.target.kind === "option" && pos.option?.underlying === sym()
+  );
   const rows = (() => {
     const strikes = exp.calls.map((c) => c.spec.strike);
     return strikes.map((k) => {
@@ -4063,6 +4406,27 @@ function renderOptionsScreen() {
       </tr>`;
     }).join("");
   })();
+  const resolve = W().markResolver();
+  const openPositionsHTML = positions.length === 0 ? "" : `
+    <h3 class="section-head">Open Option Positions</h3>
+    ${positions.map((pos) => {
+    const mark = resolve(pos)?.toNumber() ?? 0;
+    const upnl = W().portfolio.unrealized(pos, resolve).toNumber();
+    const opt = pos.option;
+    return `<div class="book-row" style="margin-bottom:6px">
+        <div class="book-row-info">
+          <div class="book-sym">${opt.underlying.replace("-USD", "")} ${opt.strike}${opt.right[0].toUpperCase()} ${dayLabel(opt.expiry)}</div>
+          <div class="sub-text">${pos.qty > 0 ? "Long" : "Short"} ${Math.abs(pos.qty)} \xD7 avg ${money(pos.avgCost.toNumber())}</div>
+        </div>
+        <div class="book-row-pnl">
+          <div class="book-mark">${priceFmt(mark)}</div>
+          <div class="pnl ${pnlClass(upnl)}">${money(upnl, { sign: true })}</div>
+        </div>
+        <div class="book-row-actions">
+          <button class="action-btn close-btn" data-close="${pos.key}">Close</button>
+        </div>
+      </div>`;
+  }).join("")}`;
   const body = `
     <div class="card">
       <div class="row-between">
@@ -4072,10 +4436,11 @@ function renderOptionsScreen() {
         </div>
         <div class="dim" style="font-size:11px;text-align:right">
           ${inst().assetClass === "equity" ? "American \xB7 physically settled" : "European \xB7 cash settled"}<br>
-          Tap bid/ask to trade 1 contract
+          Tap bid/ask to buy 1 contract
         </div>
       </div>
     </div>
+    ${openPositionsHTML}
     <div class="chain-tabs">${chain.expiries.map(
     (e, i) => `<button class="chip ${i === state.optExpiryIdx ? "active" : ""}" data-exp="${i}">${dayLabel(e.expiry)}</button>`
   ).join("")}</div>
@@ -4083,7 +4448,7 @@ function renderOptionsScreen() {
       <thead><tr><th>Call b/a</th><th>\u0394</th><th>IV</th><th>Strike</th><th>IV</th><th>\u0394</th><th>Put b/a</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <h3 style="margin:24px 0 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text-3)">Strategy Builder</h3>
+    <h3 class="section-head" style="margin-top:20px">Strategy Builder</h3>
     <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
       ${["Long Straddle", "Strangle", "Bull Call Spread", "Iron Condor"].map(
     (s) => `<button class="chip" data-strat="${s}">${s}</button>`
@@ -4102,6 +4467,10 @@ function renderOptionsScreen() {
     tradeOption(q);
   });
   overlay.querySelectorAll("[data-strat]").forEach((b) => b.onclick = () => buildStrategy(b.dataset.strat, exp, p.spot));
+  overlay.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => {
+    closePosition(b.dataset.close);
+    renderOptionsScreen();
+  });
 }
 function tradeOption(q) {
   const res = store.submit({ target: { kind: "option", symbol: q.spec.underlying, option: q.spec }, side: "buy", qty: 1, type: "market", tif: "DAY" });
@@ -4111,6 +4480,7 @@ function tradeOption(q) {
   }
   toast(W().mode === "live" ? "Option filled" : "Option order \u2014 fills next bar", "gain");
   refresh();
+  renderOptionsScreen();
 }
 function buildStrategy(name, exp, spot) {
   const calls = exp.calls, puts = exp.puts;
@@ -4177,24 +4547,7 @@ function renderStatsScreen() {
       ${stat("Avg Loss", money(Number(r.trade.avgLoss)), "loss")}
       ${stat("Max Drawdown", money(Number(r.drawdown.maxDrawdown)) + ` (${(r.drawdown.maxDrawdownPct * 100).toFixed(1)}%)`, "loss")}
       ${stat("Avg Hold", r.trade.avgHoldHours.toFixed(1) + "h")}
-      ${stat("Turnover", r.turnover.toFixed(2) + "x")}
-      ${stat("Peak Equity", money(Number(r.drawdown.peakEquity)))}
-    </div>
-    ${r.options.assignments + r.options.exercised + r.options.expiredWorthless > 0 || r.options.avgEntryIv > 0 ? `
-    <h3 style="margin:4px 0 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text-3)">Options</h3>
-    <div class="stat-grid">
-      ${stat("Avg Entry IV", (r.options.avgEntryIv * 100).toFixed(0) + "%")}
-      ${stat("Theta P&L", money(Number(r.options.thetaCapturedOrPaid)), pnlClass(Number(r.options.thetaCapturedOrPaid)))}
-      ${stat("Exercised", String(r.options.exercised))}
-      ${stat("Assigned", String(r.options.assignments))}
-    </div>` : ""}
-    ${r.byAssetClass.length ? `
-    <h3 style="margin:4px 0 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text-3)">By Asset Class</h3>
-    <div class="card">${r.byAssetClass.map((b) => `<div class="row-between" style="padding:7px 0;border-bottom:1px solid var(--hairline-2)">
-        <span>${b.key}</span>
-        <span class="num ${pnlClass(Number(b.realized))}">${money(Number(b.realized), { sign: true })} <span class="dim">${b.trades} trades</span></span>
-      </div>`).join("")}
-    </div>` : ""}`;
+    </div>`;
   overlay.innerHTML = screenShell("Statistics", body);
   document.getElementById("backBtn").onclick = closeScreen;
   requestAnimationFrame(() => drawEquityCurve(
@@ -4224,7 +4577,6 @@ function renderLearnScreen() {
           <span>${m.index}. ${m.title}</span>
           ${st.passed ? `<span class="badge done">\u2713 ${(st.bestScore * 100).toFixed(0)}%</span>` : ""}
           ${!st.unlocked ? `<span class="badge">Locked</span>` : ""}
-          ${m.checkpoint ? `<span class="badge" style="font-size:10px">Checkpoint</span>` : ""}
         </div>
         <div class="lesson-body">${m.summary}</div>
       </div>`;
@@ -4242,10 +4594,8 @@ function renderModule(id) {
   const answers = {};
   const body = `
     ${m.lessons.map((l) => `
-      <div class="card">
-        <strong>${l.title}</strong>
+      <div class="card"><strong>${l.title}</strong>
         <div class="lesson-body">${l.body}</div>
-        ${l.demo ? `<div class="dim mt" style="font-size:12px">\u26A1 Interactive: ${l.demo.note} (${l.demo.underlying})</div>` : ""}
       </div>`).join("")}
     <h3 style="margin:16px 0 10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--text-3)">Quiz \u2014 pass \u2265 ${(m.passThreshold * 100).toFixed(0)}%</h3>
     <div id="quiz">
@@ -4279,7 +4629,7 @@ function renderModule(id) {
     const note = document.getElementById("quizNote");
     note.style.color = res.passed ? "var(--gain)" : "var(--loss)";
     note.textContent = `${(res.bestScore * 100).toFixed(0)}% \u2014 ${res.passed ? "Passed \u2713" : "Keep going \u2014 review and retake."}`;
-    renderSidebar();
+    renderNav();
   };
 }
 function renderSettingsScreen() {
@@ -4287,43 +4637,32 @@ function renderSettingsScreen() {
   const s = W().settings;
   const body = `
     <div class="card">
-      ${toggleRow("Help & Learning", "Terminal teaching notes and the options learning track. Off = pure analytical mode.", s.helpEnabled, "helpEnabled")}
+      ${toggleRow("Live market prices", "Crypto prices update from Coinbase in real time. Off = historical simulation.", store.live, "liveMode")}
+      ${toggleRow("Help & Learning", "Enable the options learning track and terminal commentary.", s.helpEnabled, "helpEnabled")}
       ${toggleRow("Fee & spread realism", "Model bid/ask spread, slippage and fees on fills.", s.feeRealism, "feeRealism")}
-      ${toggleRow("Live crypto mode", "Crypto follows real-time price; orders fill immediately.", W().mode === "live", "liveMode")}
       ${toggleRow("Light theme", "Switch to the light appearance.", store.ui.theme === "light", "theme")}
     </div>
     <div class="card">
       <div class="set-row">
-        <div class="label">
-          <div>Add funds</div>
-          <div class="sub">Current cash: ${money(W().portfolio.cash.toNumber())}</div>
-        </div>
+        <div class="label"><div>Add funds</div><div class="sub">Current cash: ${money(W().portfolio.cash.toNumber())}</div></div>
       </div>
-      <div style="display:flex;gap:8px;margin-top:2px">
-        <input class="input num" id="depAmt" inputmode="decimal" placeholder="10000" style="max-width:160px">
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <input class="input num" id="depAmt" inputmode="decimal" placeholder="500" style="max-width:140px">
         <button class="adv-btn" id="depBtn">Deposit</button>
       </div>
     </div>
     <div class="card">
       <div class="set-row">
         <div class="label"><div>Risk-free rate</div><div class="sub">Used for option pricing (BSM/BAW)</div></div>
-        <input class="input num" id="rfr" style="width:80px" value="${(s.riskFreeRate * 100).toFixed(1)}">
-      </div>
-      <div class="set-row">
-        <div class="label"><div>Margin multiplier</div><div class="sub">Buying-power leverage</div></div>
-        <input class="input num" id="marg" style="width:80px" value="${s.marginMultiplier}">
+        <input class="input num" id="rfr" style="width:72px" value="${(s.riskFreeRate * 100).toFixed(1)}">
       </div>
     </div>
     <div class="card">
       <div class="set-row" style="border-bottom:none;padding-bottom:6px">
-        <div class="label">
-          <div>Reset account</div>
-          <div class="sub">Wipe portfolio, orders and clock back to the start, and set a fresh starting bankroll.</div>
-        </div>
+        <div class="label"><div>Reset account</div><div class="sub">Wipe portfolio, orders and clock to a fresh start.</div></div>
       </div>
       <div style="display:flex;gap:8px;align-items:center">
-        <label class="dim" style="font-size:12px">Starting bankroll</label>
-        <input class="input num" id="resetCash" style="max-width:160px" value="${Math.round(W().settings.startingCash)}">
+        <input class="input num" id="resetCash" style="max-width:140px" value="${Math.round(W().settings.startingCash)}" placeholder="1000">
         <button class="adv-btn" id="resetBtn" style="color:var(--loss);border-color:var(--loss);margin-left:auto">Reset</button>
       </div>
     </div>
@@ -4350,13 +4689,9 @@ function renderSettingsScreen() {
   document.getElementById("rfr").addEventListener("change", (e) => {
     store.updateSettings({ riskFreeRate: (parseFloat(e.target.value) || 4) / 100 });
   });
-  document.getElementById("marg").addEventListener("change", (e) => {
-    store.updateSettings({ marginMultiplier: parseFloat(e.target.value) || 1 });
-    refresh();
-  });
   document.getElementById("resetBtn").onclick = () => {
     const cash = Math.max(0, parseFloat(document.getElementById("resetCash").value) || W().settings.startingCash);
-    if (confirm(`Reset your account to a ${money(cash)} bankroll? This wipes portfolio, orders and clock.`)) {
+    if (confirm(`Reset account to ${money(cash)} bankroll? This wipes all positions, orders and history.`)) {
       store.reset(cash);
       state.screen = "trade";
       renderShell();
@@ -4373,23 +4708,44 @@ function toggleRow(label, sub, on, key) {
 function onToggle(key) {
   if (key === "helpEnabled") {
     store.updateSettings({ helpEnabled: !W().settings.helpEnabled });
-    renderSidebar();
+    renderNav();
   } else if (key === "feeRealism") store.updateSettings({ feeRealism: !W().settings.feeRealism });
-  else if (key === "liveMode") store.setMode(W().mode === "live" ? "historical" : "live");
-  else if (key === "theme") {
+  else if (key === "liveMode") {
+    if (store.live) {
+      store.ui.livePref = false;
+      store.saveUi();
+      store.disableLive();
+      toast("Simulation mode");
+    } else {
+      store.ui.livePref = true;
+      store.saveUi();
+      void store.enableLive().then(() => {
+        if (store.live) {
+          toast("Live prices active", "gain");
+        } else {
+          toast("Could not connect \u2014 staying in simulation");
+        }
+        renderNav();
+        renderSettingsScreen();
+        refresh();
+      });
+      return;
+    }
+  } else if (key === "theme") {
     store.ui.theme = store.ui.theme === "light" ? "dark" : "light";
     store.saveUi();
     document.documentElement.setAttribute("data-theme", store.ui.theme);
-    chart.setData(visibleBars());
+    chart?.setData(visibleBars());
   }
   renderSettingsScreen();
+  renderNav();
   refresh();
 }
 function toast(msg, cls = "") {
   const t = document.getElementById("toast");
   t.className = `toast show ${cls}`;
   t.textContent = msg;
-  setTimeout(() => t.className = "toast", 2e3);
+  setTimeout(() => t.className = "toast", 2500);
 }
 function ceilTo(t, step) {
   return Math.ceil(t / step) * step;
@@ -4414,37 +4770,41 @@ function brandMark() {
   </div>`;
 }
 function tradeIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-    <line x1="7" y1="4" x2="7" y2="6.5"/>
-    <rect x="4.5" y="6.5" width="5" height="7" rx="0.75"/>
-    <line x1="7" y1="13.5" x2="7" y2="16"/>
-    <line x1="15" y1="7" x2="15" y2="9.5"/>
-    <rect x="12.5" y="9.5" width="5" height="6" rx="0.75"/>
-    <line x1="15" y1="15.5" x2="15" y2="18"/>
+  return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+    <polyline points="3,17 7,11 11,14 15,7 21,7"/>
+    <polyline points="17,7 21,7 21,11"/>
+  </svg>`;
+}
+function bookIcon() {
+  return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="3" width="18" height="18" rx="2"/>
+    <line x1="3" y1="9" x2="21" y2="9"/>
+    <line x1="3" y1="15" x2="21" y2="15"/>
+    <line x1="9" y1="9" x2="9" y2="21"/>
   </svg>`;
 }
 function optionsIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M9 19H5a2 2 0 0 1-2-2v-4c0-1.1.9-2 2-2h4"/>
-    <path d="M15 5h4a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-4"/>
-    <line x1="12" y1="5" x2="12" y2="19"/>
+  return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="3"/>
+    <path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>
+    <path d="M4.9 4.9l2.1 2.1M16.9 16.9l2.1 2.1M19.1 4.9l-2.1 2.1M7.1 16.9l-2.1 2.1"/>
   </svg>`;
 }
 function statsIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/>
   </svg>`;
 }
 function learnIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
     <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
   </svg>`;
 }
 function settingsIcon() {
-  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <circle cx="12" cy="12" r="3"/>
-    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
   </svg>`;
 }
 boot();
