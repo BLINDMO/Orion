@@ -1,0 +1,12 @@
+{
+  "name": "@orion/app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ORION web client — a thin renderer over @orion/sim",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --serve",
+    "serve": "node serve.mjs"
+  }
+}

@@ -23,10 +23,34 @@ screen; it never intrudes on the live trading UI.
 sim/        The simulation core — pure, framework-agnostic, deterministic
             TypeScript (spec §3). This is the heart of the product: the UI is a
             thin renderer over it. Fully unit-tested, runs offline, no UI deps.
+app/        A WORKING web client over the engine — trading terminal, options
+            chain + strategy builder, time-scrubbing, stats, learning track,
+            settings. Verified end-to-end in a headless browser.
 design/     Design-system tokens (spec §2): color, spacing, radius, elevation,
             typography (tabular numerals), motion/springs, haptics — the source
-            of truth the RN/Skia client consumes.
+            of truth every client consumes.
 ```
+
+## The app
+
+A complete, running ORION client lives in `app/` — built as a thin renderer over
+the engine, so the chart and the book can never disagree and no UI path can
+introduce look-ahead.
+
+| Trade terminal | Options + strategy | Statistics |
+|---|---|---|
+| ![Trade](docs/screenshots/trade.png) | ![Options](docs/screenshots/options.png) | ![Stats](docs/screenshots/stats.png) |
+
+```bash
+cd app && npm i -D esbuild && npm run build && npm run serve   # http://localhost:5173
+```
+
+It covers the full loop: candlestick charting with indicators and the Terminal
+scanner, an institutional order ticket (market/limit/stop/stop-limit/trailing),
+player-controlled time with animated scrubbing, the options chain + multi-leg
+strategy builder with payoff diagrams, the stats dashboard, the gated learning
+track, settings (incl. Live mode + the Help toggle), and onboarding disclosure.
+Sessions persist via a deterministic action log and replay on reload.
 
 ## What is built here
 
