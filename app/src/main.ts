@@ -19,6 +19,7 @@ import {
   ironCondor,
 } from "../../sim/src/options/strategies.ts";
 import { Store } from "./store.ts";
+import { isLiveSymbol } from "./live.ts";
 import { Chart } from "./ui/chart.ts";
 import { drawEquityCurve, drawPayoff } from "./ui/canvas.ts";
 import * as F from "./ui/format.ts";
@@ -119,10 +120,11 @@ function renderShell() {
               <button class="adv-btn" data-adv="m">+30D</button>
             </div>
           </div>
+          <div class="drawer-backdrop" id="drawerBackdrop"></div>
           <aside class="drawer" id="drawer">
             <div class="drawer-header">
               <div class="drawer-tabs" id="drawerTabs"></div>
-              <button class="drawer-close" id="drawerClose">✕</button>
+              <button class="drawer-close" id="drawerClose" aria-label="Back to chart">‹ Chart</button>
             </div>
             <div class="drawer-body" id="drawerBody"></div>
           </aside>
@@ -278,8 +280,7 @@ function renderDrawerBody() {
 
 function openScanTab() {
   state.drawerTab = "scan";
-  state.drawerOpen = true;
-  document.getElementById("drawer")!.classList.add("open");
+  openDrawer();
   renderDrawerTabs();
   renderDrawerBody();
 }
@@ -287,11 +288,10 @@ function openScanTab() {
 // One-tap entry into the order ticket with a preset side. If a screen overlay
 // is open (Options/Stats/etc.), drop back to the trade surface first.
 function openTicket(side: Side) {
-  if (state.screen !== "trade") navigate("trade");
+  if (state.screen !== "trade") { navigate("trade"); }
   state.form.side = side;
   state.drawerTab = "trade";
-  state.drawerOpen = true;
-  document.getElementById("drawer")!.classList.add("open");
+  openDrawer();
   renderDrawerTabs();
   renderDrawerBody();
   const q = document.getElementById("qty") as HTMLInputElement | null;
@@ -299,10 +299,20 @@ function openTicket(side: Side) {
 }
 
 function wireDrawerClose() {
-  document.getElementById("drawerClose")!.onclick = () => {
-    state.drawerOpen = false;
-    document.getElementById("drawer")!.classList.remove("open");
-  };
+  document.getElementById("drawerClose")!.onclick = closeDrawer;
+  document.getElementById("drawerBackdrop")!.onclick = closeDrawer;
+}
+
+function closeDrawer() {
+  state.drawerOpen = false;
+  document.getElementById("drawer")?.classList.remove("open");
+  document.getElementById("drawerBackdrop")?.classList.remove("show");
+}
+
+function openDrawer() {
+  state.drawerOpen = true;
+  document.getElementById("drawer")?.classList.add("open");
+  document.getElementById("drawerBackdrop")?.classList.add("show");
 }
 
 // ─── Order Ticket ────────────────────────────────────
@@ -513,6 +523,8 @@ function closePosition(key: string) {
 
 // ─── Time Controls ───────────────────────────────────
 function wireTime() {
+  // In live mode the real clock drives the world — manual advance is disabled.
+  if (store.live) { setAdvButtons(false); return; }
   document.querySelectorAll<HTMLElement>("[data-adv]").forEach((b) => b.onclick = () => {
     if (state.scrubbing) return;
     const kind = b.dataset.adv!;
@@ -601,12 +613,12 @@ function updateHeader() {
   }
 
   const tl = document.getElementById("timeLabel");
-  if (tl) tl.textContent = `◷ ${F.dateLabel(W().now)}`;
+  if (tl) tl.textContent = store.live ? `◷ ${F.dateLabel(W().now)} · streaming` : `◷ ${F.dateLabel(W().now)}`;
   const mp = document.getElementById("modePill");
   if (mp) {
-    mp.textContent = W().mode === "live" ? "LIVE" : "";
-    mp.className = `mode-pill ${W().mode === "live" ? "live" : ""}`;
-    mp.style.display = W().mode === "live" ? "" : "none";
+    mp.textContent = store.live ? "● LIVE" : "";
+    mp.className = `mode-pill ${store.live ? "live" : ""}`;
+    mp.style.display = store.live ? "" : "none";
   }
 }
 
@@ -628,11 +640,10 @@ function refresh() {
 function navigate(s: Screen) {
   state.screen = s;
   if (s === "trade") {
+    // Tapping Trade always reveals the chart; close the ticket drawer so the
+    // graph is one tap away even mid-order. Buy/Sell re-opens the ticket.
     document.getElementById("overlay")!.innerHTML = "";
-    if (window.innerWidth <= 900) {
-      state.drawerOpen = true;
-      document.getElementById("drawer")!.classList.add("open");
-    }
+    closeDrawer();
     chart.setData(visibleBars());
     renderSidebar();
     refresh();
@@ -933,7 +944,7 @@ function renderSettingsScreen() {
     <div class="card">
       ${toggleRow("Help & Learning", "Terminal teaching notes and the options learning track. Off = pure analytical mode.", s.helpEnabled, "helpEnabled")}
       ${toggleRow("Fee & spread realism", "Model bid/ask spread, slippage and fees on fills.", s.feeRealism, "feeRealism")}
-      ${toggleRow("Live crypto mode", "Crypto follows real-time price; orders fill immediately.", W().mode === "live", "liveMode")}
+      ${toggleRow("Live market data", "Stream real BTC / ETH / SOL prices from Coinbase (free, no key). Orders fill at the live price; time controls are disabled while live.", store.live, "liveMode")}
       ${toggleRow("Light theme", "Switch to the light appearance.", store.ui.theme === "light", "theme")}
     </div>
     <div class="card">
@@ -1015,7 +1026,7 @@ function toggleRow(label: string, sub: string, on: boolean, key: string) {
 function onToggle(key: string) {
   if (key === "helpEnabled") { store.updateSettings({ helpEnabled: !W().settings.helpEnabled }); renderSidebar(); }
   else if (key === "feeRealism") store.updateSettings({ feeRealism: !W().settings.feeRealism });
-  else if (key === "liveMode") store.setMode(W().mode === "live" ? "historical" : "live");
+  else if (key === "liveMode") { void toggleLive(); return; }
   else if (key === "theme") {
     store.ui.theme = store.ui.theme === "light" ? "dark" : "light";
     store.saveUi();
@@ -1035,6 +1046,38 @@ function toast(msg: string, cls = "") {
 }
 
 function ceilTo(t: number, step: number) { return Math.ceil(t / step) * step; }
+
+// Toggle the live Coinbase feed. On enable, fetch real prices, rebuild the
+// world, and re-render the trade surface; on failure, surface the reason and
+// stay in the simulator.
+async function toggleLive() {
+  if (store.live) {
+    store.disableLive();
+    store.onLiveTick = null;
+    toast("Live data off — back to simulator");
+    if (store.ui.symbol && !W().universe.has(store.ui.symbol)) store.ui.symbol = "BTC-USD";
+    renderShell();
+    return;
+  }
+  // Live streams crypto — focus a crypto symbol so the chart shows live bars.
+  if (!isLiveSymbol(store.ui.symbol)) { store.ui.symbol = "BTC-USD"; store.saveUi(); }
+  toast("Connecting to live market data…");
+  try {
+    await store.enableLive();
+    store.onLiveTick = onLiveTick;
+    renderShell();
+    toast("Live market data on", "gain");
+  } catch (e) {
+    toast("Couldn't reach live data — staying in simulator", "loss");
+    console.warn("Live data failed:", e);
+    renderSettingsScreen();
+  }
+}
+
+function onLiveTick() {
+  if (state.screen === "trade") chart.setData(visibleBars());
+  refresh();
+}
 
 function brandLogoLarge(): string {
   return `<svg class="splash-logo" width="64" height="64" viewBox="0 0 24 24" fill="none">

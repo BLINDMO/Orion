@@ -5,10 +5,17 @@ import {
   World,
   universe,
   buildSeedData,
+  InstrumentData,
+  BarSeries,
   type AccountSettings,
   type OrderRequest,
+  type Bar,
+  type Resolution,
   LearningProgress,
 } from "../../sim/src/index.ts";
+import { LIVE_SYMBOLS, fetchSymbol, type Fetcher } from "./live.ts";
+
+const RES_MS: Record<Resolution, number> = { "1m": 60_000, "1h": 3_600_000, "1d": 86_400_000 };
 
 type Action =
   | { k: "submit"; req: OrderRequest }
@@ -50,9 +57,16 @@ export class Store {
   ui = { symbol: "BTC-USD", theme: "dark" as "dark" | "light", onboarded: false };
   private settings: Partial<AccountSettings>;
 
+  // Live market-data session (real Coinbase prices). Kept separate from the
+  // deterministic historical world so toggling Live never corrupts the replay.
+  live = false;
+  onLiveTick: (() => void) | null = null;
+  private histWorld: World | null = null;
+  private liveTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor() {
     const saved = this.load();
-    this.settings = saved?.settings ?? { startingCash: 25_000 };
+    this.settings = saved?.settings ?? { startingCash: 1_000 };
     if (saved) {
       this.ui = saved.ui;
       this.progress = LearningProgress.fromJSON(saved.progress as { results?: never });
@@ -94,7 +108,7 @@ export class Store {
   }
 
   // Public mutators (record + persist) -------------------------------------
-  submit(req: OrderRequest) { const r = this.world.submit(req); if (r.ok) { this.actions.push({ k: "submit", req }); this.save(); } return r; }
+  submit(req: OrderRequest) { const r = this.world.submit(req); if (r.ok && !this.live) { this.actions.push({ k: "submit", req }); this.save(); } return r; }
   cancel(id: string) { const ok = this.world.cancel(id); if (ok) this.record({ k: "cancel", id }); return ok; }
   advanceTo(to: number) { this.world.advanceTo(to, { stepRes: to - this.world.now > 2 * 86400_000 ? "1h" : "1m" }); this.record({ k: "advance", to }); }
   deposit(amt: number) { this.world.deposit(amt); this.record({ k: "deposit", amt }); }
@@ -108,7 +122,69 @@ export class Store {
   /** Record an advance the UI already applied to the world (animated scrubbing). */
   noteAdvance(to: number) { this.record({ k: "advance", to }); }
 
-  private record(a: Action) { this.actions.push(a); this.save(); }
+  // ── Live market data ────────────────────────────────────────────────────
+  /**
+   * Switch to a live world driven by real crypto prices. Fetches recent candles
+   * for each live symbol, builds a fresh world anchored at the real last close,
+   * and starts polling. Throws (leaving the historical world intact) on failure.
+   */
+  async enableLive(fetcher?: Fetcher): Promise<void> {
+    if (this.live) return;
+    const data = buildSeedData(START, DAYS); // equities stay synthetic
+    let now = 0;
+    for (const sym of LIVE_SYMBOLS) {
+      const snap = await fetchSymbol(sym, fetcher);
+      const series: Partial<Record<Resolution, BarSeries>> = {};
+      for (const res of ["1h", "1d"] as Resolution[]) {
+        const bars = snap.bars[res];
+        if (bars && bars.length) {
+          series[res] = new BarSeries(res, bars);
+          const last = bars[bars.length - 1]!;
+          now = Math.max(now, last.t + RES_MS[res]);
+        }
+      }
+      if (Object.keys(series).length) data.set(sym, new InstrumentData(sym, series));
+    }
+    if (!now) throw new Error("No live data returned");
+
+    this.histWorld = this.world;
+    this.world = new World({ universe, data, startNow: now, settings: { ...this.world.settings } });
+    this.world.setMode("live");
+    this.live = true;
+    this.liveTimer = setInterval(() => { void this.pollLive(fetcher); }, 30_000);
+  }
+
+  private async pollLive(fetcher?: Fetcher): Promise<void> {
+    if (!this.live) return;
+    let now = this.world.now;
+    for (const sym of LIVE_SYMBOLS) {
+      try {
+        const snap = await fetchSymbol(sym, fetcher);
+        const id = this.world.data.get(sym);
+        if (!id) continue;
+        for (const res of ["1h", "1d"] as Resolution[]) {
+          const bars = snap.bars[res];
+          if (bars && bars.length) {
+            id.appendLive(res, bars);
+            now = Math.max(now, bars[bars.length - 1]!.t + RES_MS[res]);
+          }
+        }
+      } catch { /* transient network error — keep last good prices */ }
+    }
+    if (now > this.world.now) this.world.advanceTo(now, { stepRes: "1h" });
+    this.onLiveTick?.();
+  }
+
+  /** Return to the deterministic historical world. */
+  disableLive(): void {
+    if (!this.live) return;
+    if (this.liveTimer) { clearInterval(this.liveTimer); this.liveTimer = null; }
+    if (this.histWorld) this.world = this.histWorld;
+    this.histWorld = null;
+    this.live = false;
+  }
+
+  private record(a: Action) { if (this.live) return; this.actions.push(a); this.save(); }
 
   save() {
     const p: Persisted = {

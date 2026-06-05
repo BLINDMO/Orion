@@ -1,17 +1,17 @@
 /* ORION — professional dark trading terminal */
 :root {
-  /* Backgrounds */
-  --ink: #0d1117;
-  --ink-elev: #131922;
-  --surface: #1a2030;
-  --surface-2: #1e2638;
-  --hairline: #242f42;
-  --hairline-2: #1a2333;
+  /* Backgrounds — a brighter, lifted dark (still pro, less cave-like) */
+  --ink: #171d28;
+  --ink-elev: #1e2533;
+  --surface: #27303f;
+  --surface-2: #2f3949;
+  --hairline: #38445a;
+  --hairline-2: #283242;
 
   /* Text */
-  --text-1: #cdd5e0;
-  --text-2: #7b8899;
-  --text-3: #404d60;
+  --text-1: #eaeef5;
+  --text-2: #9eabbd;
+  --text-3: #617085;
 
   /* Accent */
   --accent: #4c8dff;
@@ -351,7 +351,8 @@ canvas { display: block; }
   color: var(--text-3);
   flex-shrink: 0;
 }
-.mode-pill.live { color: var(--gain); border-color: rgba(34, 201, 122, 0.3); }
+.mode-pill.live { color: var(--gain); border-color: rgba(34, 201, 122, 0.35); background: var(--gain-subtle); animation: livePulse 2s ease-in-out infinite; }
+@keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 .adv-btn {
   padding: 7px 14px;
   border-radius: var(--r);
@@ -400,16 +401,20 @@ canvas { display: block; }
 .drawer-tab.active { color: var(--text-1); border-bottom-color: var(--accent); }
 .drawer-tab:hover:not(.active) { color: var(--text-2); }
 .drawer-close {
-  width: 42px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-3);
-  font-size: 15px;
-  border-left: 1px solid var(--hairline);
   display: none;
+  align-items: center;
+  gap: 4px;
+  padding: 0 14px;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 700;
+  border-left: 1px solid var(--hairline);
+  flex-shrink: 0;
 }
-.drawer-close:hover { color: var(--text-1); background: var(--surface); }
+.drawer-close:hover { background: var(--surface); }
+
+/* Backdrop behind the mobile ticket drawer — tap to dismiss */
+.drawer-backdrop { display: none; }
 .drawer-body {
   flex: 1;
   overflow-y: auto;
@@ -788,6 +793,17 @@ table.chain .buyc:hover { color: var(--gain); text-decoration: underline; }
   }
   .drawer.open { transform: translateX(0); }
   .drawer-close { display: flex; }
+  .drawer-backdrop {
+    display: block;
+    position: fixed;
+    inset: var(--topbar-h) 0 54px 0;
+    background: rgba(0, 0, 0, 0.5);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.26s var(--ease);
+    z-index: 24;
+  }
+  .drawer-backdrop.show { opacity: 1; pointer-events: auto; }
   .topbar-acct { display: none; }
   .topbar-price .px { font-size: 18px; }
   .quickbar { gap: 14px; }

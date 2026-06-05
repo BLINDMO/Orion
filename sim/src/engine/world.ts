@@ -54,7 +54,7 @@ export interface SubmitResult {
 }
 
 const DEFAULT_SETTINGS: AccountSettings = {
-  startingCash: 25_000,
+  startingCash: 1_000,
   riskFreeRate: 0.04,
   dividendYield: 0.01,
   feeRealism: true,
