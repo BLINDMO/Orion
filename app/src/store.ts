@@ -28,9 +28,13 @@ interface Persisted {
   progress: Record<string, unknown>;
 }
 
-const KEY = "orion.session.v1";
+const KEY = "orion.session.v2";
 const START = Date.UTC(2023, 0, 2);
-const DAYS = 45;
+const DAYS = 60;
+// Begin the clock well into the dataset so there is real chart history to read
+// (and enough closed bars for SMA/EMA/Bollinger to compute) while leaving a
+// long unknown future to trade into.
+const HISTORY_DAYS = 25;
 
 export class Store {
   world!: World;
@@ -54,7 +58,7 @@ export class Store {
     this.world = new World({
       universe,
       data,
-      startNow: (saved?.start ?? START) + 24 * 3600_000,
+      startNow: (saved?.start ?? START) + HISTORY_DAYS * 24 * 3600_000,
       settings: this.settings,
     });
     if (saved) {

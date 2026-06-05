@@ -2829,9 +2829,10 @@ function getCurriculum(world) {
 }
 
 // src/store.ts
-var KEY = "orion.session.v1";
+var KEY = "orion.session.v2";
 var START = Date.UTC(2023, 0, 2);
-var DAYS = 45;
+var DAYS = 60;
+var HISTORY_DAYS = 25;
 var Store = class {
   world;
   actions = [];
@@ -2852,7 +2853,7 @@ var Store = class {
     this.world = new World({
       universe,
       data,
-      startNow: (saved?.start ?? START) + 24 * 36e5,
+      startNow: (saved?.start ?? START) + HISTORY_DAYS * 24 * 36e5,
       settings: this.settings
     });
     if (saved) {
@@ -2968,37 +2969,51 @@ var Store = class {
 
 // src/ui/chart.ts
 var css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+var MA_COLORS = ["#4c8dff", "#f5a623", "#22c97a"];
+var AX_R = 62;
+var AX_B = 22;
+var PAD_T = 10;
 var Chart = class {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
     this.bindEvents();
-    new ResizeObserver(() => this.resize()).observe(canvas);
+    this.ro = new ResizeObserver(() => this.resize());
+    this.ro.observe(canvas);
+    this.resize();
   }
   canvas;
   ctx;
   bars = [];
   cfg = { sma: [50], ema: [20], bollinger: true, vwap: false };
-  view = 120;
-  // number of bars visible
+  view = 90;
   offset = 0;
-  // bars scrolled from the right
   crosshair = null;
   W = 0;
   H = 0;
   dpr = 1;
+  dragging = false;
+  lastX = 0;
+  ro;
+  destroy() {
+    this.ro.disconnect();
+  }
   setConfig(cfg) {
     this.cfg = { ...this.cfg, ...cfg };
     this.render();
   }
   setData(bars, opts = {}) {
     this.bars = bars;
-    if (opts.resetView) this.offset = 0;
+    if (opts.resetView) {
+      this.offset = 0;
+      this.view = Math.min(90, Math.max(40, bars.length));
+    }
     this.render();
   }
   resize() {
     this.dpr = Math.min(window.devicePixelRatio || 1, 2.5);
     const r = this.canvas.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return;
     this.W = r.width;
     this.H = r.height;
     this.canvas.width = Math.round(r.width * this.dpr);
@@ -3007,44 +3022,48 @@ var Chart = class {
     this.render();
   }
   bindEvents() {
-    this.canvas.addEventListener("wheel", (e) => {
+    const c = this.canvas;
+    c.style.touchAction = "none";
+    c.addEventListener("wheel", (e) => {
       e.preventDefault();
-      const factor = e.deltaY > 0 ? 1.1 : 0.9;
-      this.view = Math.max(20, Math.min(600, Math.round(this.view * factor)));
+      const factor = e.deltaY > 0 ? 1.12 : 0.89;
+      this.view = Math.max(25, Math.min(this.bars.length || 600, Math.round(this.view * factor)));
       this.render();
     }, { passive: false });
-    let dragging = false;
-    let lastX = 0;
-    const start = (x) => {
-      dragging = true;
-      lastX = x;
-    };
-    const move = (x, y, rect) => {
-      this.crosshair = { x: x - rect.left, y: y - rect.top };
-      if (dragging) {
-        const dx = x - lastX;
-        const barW = this.W / this.view;
-        this.offset = Math.max(0, Math.min(this.bars.length - 10, this.offset + Math.round(dx / barW)));
-        lastX = x;
+    c.addEventListener("pointerdown", (e) => {
+      this.dragging = true;
+      this.lastX = e.clientX;
+      c.setPointerCapture(e.pointerId);
+    });
+    c.addEventListener("pointermove", (e) => {
+      const rect = c.getBoundingClientRect();
+      this.crosshair = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      if (this.dragging) {
+        const dx = e.clientX - this.lastX;
+        const barW = (this.W - AX_R) / this.view;
+        const step = Math.round(dx / barW);
+        if (step !== 0) {
+          this.offset = Math.max(0, Math.min(Math.max(0, this.bars.length - 10), this.offset + step));
+          this.lastX = e.clientX;
+        }
       }
       this.render();
-    };
-    const end = () => {
-      dragging = false;
-    };
-    this.canvas.addEventListener("mousedown", (e) => start(e.clientX));
-    window.addEventListener("mousemove", (e) => move(e.clientX, e.clientY, this.canvas.getBoundingClientRect()));
-    window.addEventListener("mouseup", end);
-    this.canvas.addEventListener("mouseleave", () => {
-      this.crosshair = null;
-      this.render();
     });
-    this.canvas.addEventListener("touchstart", (e) => start(e.touches[0].clientX), { passive: true });
-    this.canvas.addEventListener("touchmove", (e) => {
-      const t = e.touches[0];
-      move(t.clientX, t.clientY, this.canvas.getBoundingClientRect());
-    }, { passive: true });
-    this.canvas.addEventListener("touchend", end);
+    const release = (e) => {
+      this.dragging = false;
+      try {
+        c.releasePointerCapture(e.pointerId);
+      } catch {
+      }
+    };
+    c.addEventListener("pointerup", release);
+    c.addEventListener("pointercancel", release);
+    c.addEventListener("pointerleave", () => {
+      if (!this.dragging) {
+        this.crosshair = null;
+        this.render();
+      }
+    });
   }
   visibleSlice() {
     const end = this.bars.length - this.offset;
@@ -3053,8 +3072,11 @@ var Chart = class {
   }
   render() {
     const ctx = this.ctx;
+    if (this.W === 0 || this.H === 0) return;
     ctx.clearRect(0, 0, this.W, this.H);
-    if (this.bars.length < 2 || this.W === 0) {
+    ctx.fillStyle = css("--ink");
+    ctx.fillRect(0, 0, this.W, this.H);
+    if (this.bars.length < 2) {
       ctx.fillStyle = css("--text-3");
       ctx.font = "13px Inter, sans-serif";
       ctx.textAlign = "center";
@@ -3062,40 +3084,58 @@ var Chart = class {
       return;
     }
     const { slice, startIdx } = this.visibleSlice();
-    const padR = 58;
-    const volH = this.H * 0.16;
-    const priceH = this.H - volH - 8;
-    const plotW = this.W - padR;
+    if (slice.length < 1) return;
+    const plotW = this.W - AX_R;
+    const plotH = this.H - AX_B - PAD_T;
+    const volH = plotH * 0.18;
+    const priceH = plotH - volH - 6;
     let hi = -Infinity, lo = Infinity, maxVol = 0;
     for (const b of slice) {
       hi = Math.max(hi, b.h);
       lo = Math.min(lo, b.l);
       maxVol = Math.max(maxVol, b.v);
     }
-    const padV = (hi - lo) * 0.08 || hi * 0.01;
+    const closesAll = this.bars.map((b) => b.c);
+    const considerLine = (s) => {
+      for (let i = 0; i < slice.length; i++) {
+        const v = s[startIdx + i];
+        if (v !== void 0) {
+          hi = Math.max(hi, v);
+          lo = Math.min(lo, v);
+        }
+      }
+    };
+    let bb = null;
+    if (this.cfg.bollinger) {
+      bb = indicators_exports.bollinger(closesAll, 20, 2);
+      considerLine(bb.upper);
+      considerLine(bb.lower);
+    }
+    const padV = (hi - lo) * 0.06 || hi * 0.01 || 1;
     hi += padV;
     lo -= padV;
-    const yOf = (p) => (hi - p) / (hi - lo) * priceH;
-    const xOf = (i) => (i + 0.5) * (plotW / slice.length);
-    const barW = Math.max(1, plotW / slice.length * 0.66);
+    const span = hi - lo || 1;
+    const yOf = (p) => PAD_T + (hi - p) / span * priceH;
+    const colW = plotW / slice.length;
+    const xOf = (i) => (i + 0.5) * colW;
+    const barW = Math.max(1, colW * 0.62);
     ctx.strokeStyle = css("--hairline");
     ctx.fillStyle = css("--text-3");
     ctx.lineWidth = 1;
-    ctx.font = "11px 'Roboto Mono', monospace";
+    ctx.font = "10px 'Roboto Mono', monospace";
     ctx.textAlign = "left";
-    const lines = 5;
-    for (let i = 0; i <= lines; i++) {
-      const p = hi - (hi - lo) * i / lines;
+    const rows = 5;
+    for (let i = 0; i <= rows; i++) {
+      const p = hi - span * i / rows;
       const y = yOf(p);
-      ctx.globalAlpha = 0.5;
+      ctx.globalAlpha = 0.35;
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(plotW, y);
       ctx.stroke();
       ctx.globalAlpha = 1;
-      ctx.fillText(fmtAxis(p), plotW + 6, y + 4);
+      ctx.fillText(fmtAxis(p), plotW + 6, y + 3);
     }
-    const closes2 = this.bars.map((b) => b.c);
     const drawLine = (series, color, width = 1.4) => {
       ctx.strokeStyle = color;
       ctx.lineWidth = width;
@@ -3115,21 +3155,21 @@ var Chart = class {
       }
       ctx.stroke();
     };
-    if (this.cfg.bollinger) {
-      const bb = indicators_exports.bollinger(closes2, 20, 2);
-      drawLine(bb.upper, "rgba(154,166,182,0.45)", 1);
-      drawLine(bb.lower, "rgba(154,166,182,0.45)", 1);
-      drawLine(bb.middle, "rgba(154,166,182,0.6)", 1);
+    if (bb) {
+      drawLine(bb.upper, "rgba(124,139,160,0.5)", 1);
+      drawLine(bb.lower, "rgba(124,139,160,0.5)", 1);
+      drawLine(bb.middle, "rgba(124,139,160,0.7)", 1);
     }
     if (this.cfg.vwap) drawLine(indicators_exports.vwap(this.bars), "#c98bff", 1.4);
-    const maColors = ["#4c8dff", "#f5b83d", "#2ecc8f"];
-    this.cfg.sma.forEach((p, i) => drawLine(indicators_exports.sma(closes2, p), maColors[i % maColors.length], 1.5));
-    this.cfg.ema.forEach((p, i) => drawLine(indicators_exports.ema(closes2, p), maColors[(i + 1) % maColors.length] + "cc", 1.2));
-    const volTop = priceH + 8;
+    const smaSeries = this.cfg.sma.map((p, i) => ({ p, s: indicators_exports.sma(closesAll, p), color: MA_COLORS[i % MA_COLORS.length] }));
+    const emaSeries = this.cfg.ema.map((p, i) => ({ p, s: indicators_exports.ema(closesAll, p), color: MA_COLORS[(i + 1) % MA_COLORS.length] }));
+    smaSeries.forEach((m) => drawLine(m.s, m.color, 1.5));
+    emaSeries.forEach((m) => drawLine(m.s, m.color, 1.2));
+    const volTop = PAD_T + priceH + 6;
     for (let i = 0; i < slice.length; i++) {
       const b = slice[i];
-      const h = b.v / maxVol * volH;
-      ctx.fillStyle = b.c >= b.o ? "rgba(46,204,143,0.35)" : "rgba(255,92,108,0.35)";
+      const h = b.v / (maxVol || 1) * volH;
+      ctx.fillStyle = b.c >= b.o ? "rgba(34,201,122,0.30)" : "rgba(255,77,94,0.30)";
       ctx.fillRect(xOf(i) - barW / 2, volTop + (volH - h), barW, h);
     }
     for (let i = 0; i < slice.length; i++) {
@@ -3145,49 +3185,101 @@ var Chart = class {
       ctx.lineTo(x, yOf(b.l));
       ctx.stroke();
       const yO = yOf(b.o), yC = yOf(b.c);
-      const top = Math.min(yO, yC);
-      ctx.fillRect(x - barW / 2, top, barW, Math.max(1, Math.abs(yC - yO)));
+      ctx.fillRect(x - barW / 2, Math.min(yO, yC), barW, Math.max(1, Math.abs(yC - yO)));
     }
     const last = slice[slice.length - 1];
     const yLast = yOf(last.c);
-    ctx.fillStyle = last.c >= last.o ? css("--gain") : css("--loss");
-    ctx.fillRect(plotW, yLast - 9, padR, 18);
-    ctx.fillStyle = "#0a0c10";
+    const lastColor = last.c >= last.o ? css("--gain") : css("--loss");
+    ctx.strokeStyle = lastColor;
+    ctx.globalAlpha = 0.4;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(0, yLast);
+    ctx.lineTo(plotW, yLast);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = lastColor;
+    ctx.fillRect(plotW, yLast - 8, AX_R, 16);
+    ctx.fillStyle = "#fff";
     ctx.textAlign = "left";
-    ctx.font = "11px 'Roboto Mono', monospace";
-    ctx.fillText(fmtAxis(last.c), plotW + 5, yLast + 4);
-    if (this.crosshair && this.crosshair.x < plotW) {
-      const idx = Math.max(0, Math.min(slice.length - 1, Math.round(this.crosshair.x / (plotW / slice.length) - 0.5)));
+    ctx.font = "10px 'Roboto Mono', monospace";
+    ctx.fillText(fmtAxis(last.c), plotW + 5, yLast + 3);
+    ctx.fillStyle = css("--text-3");
+    ctx.font = "10px 'Roboto Mono', monospace";
+    ctx.textAlign = "center";
+    const ticks = Math.min(6, slice.length);
+    for (let t = 0; t < ticks; t++) {
+      const i = Math.floor(t / (ticks - 1 || 1) * (slice.length - 1));
+      const b = slice[i];
+      const x = Math.max(20, Math.min(plotW - 20, xOf(i)));
+      ctx.fillText(fmtTime(b.t), x, this.H - 7);
+    }
+    const legend = [];
+    if (bb) legend.push({ label: "BB(20,2)", color: "rgba(124,139,160,0.9)" });
+    smaSeries.forEach((m) => legend.push({ label: `SMA${m.p} ${maybe(m.s[this.bars.length - 1 - this.offset])}`, color: m.color }));
+    emaSeries.forEach((m) => legend.push({ label: `EMA${m.p} ${maybe(m.s[this.bars.length - 1 - this.offset])}`, color: m.color }));
+    if (this.cfg.vwap) legend.push({ label: `VWAP ${maybe(indicators_exports.vwap(this.bars)[this.bars.length - 1 - this.offset])}`, color: "#c98bff" });
+    ctx.textAlign = "left";
+    ctx.font = "10px 'Roboto Mono', monospace";
+    let lx = 10;
+    for (const item of legend) {
+      ctx.fillStyle = item.color;
+      ctx.fillRect(lx, 4, 8, 8);
+      ctx.fillStyle = css("--text-2");
+      ctx.fillText(item.label, lx + 12, 12);
+      lx += ctx.measureText(item.label).width + 28;
+    }
+    if (this.crosshair && this.crosshair.x < plotW && this.crosshair.y < PAD_T + plotH) {
+      const idx = Math.max(0, Math.min(slice.length - 1, Math.round(this.crosshair.x / colW - 0.5)));
       const b = slice[idx];
       const x = xOf(idx);
-      ctx.strokeStyle = "rgba(154,166,182,0.4)";
-      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = "rgba(124,139,160,0.45)";
+      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, priceH);
+      ctx.moveTo(x, PAD_T);
+      ctx.lineTo(x, PAD_T + plotH);
       ctx.stroke();
       ctx.beginPath();
       ctx.moveTo(0, this.crosshair.y);
       ctx.lineTo(plotW, this.crosshair.y);
       ctx.stroke();
       ctx.setLineDash([]);
+      const pAtY = hi - (this.crosshair.y - PAD_T) / priceH * span;
+      if (this.crosshair.y <= PAD_T + priceH) {
+        ctx.fillStyle = css("--surface-2");
+        ctx.fillRect(plotW, this.crosshair.y - 8, AX_R, 16);
+        ctx.fillStyle = css("--text-1");
+        ctx.textAlign = "left";
+        ctx.fillText(fmtAxis(pAtY), plotW + 5, this.crosshair.y + 3);
+      }
+      const chg = (b.c - b.o) / b.o;
+      const cc = b.c >= b.o ? css("--gain") : css("--loss");
       ctx.fillStyle = css("--surface-2");
-      ctx.fillRect(8, 8, 230, 22);
-      ctx.fillStyle = css("--text-2");
+      ctx.fillRect(8, 18, 282, 20);
       ctx.font = "11px 'Roboto Mono', monospace";
       ctx.textAlign = "left";
-      const c = b.c >= b.o ? css("--gain") : css("--loss");
-      ctx.fillText(`O ${fmtAxis(b.o)}  H ${fmtAxis(b.h)}  L ${fmtAxis(b.l)}  `, 14, 23);
-      const w = ctx.measureText(`O ${fmtAxis(b.o)}  H ${fmtAxis(b.h)}  L ${fmtAxis(b.l)}  `).width;
-      ctx.fillStyle = c;
-      ctx.fillText(`C ${fmtAxis(b.c)}`, 14 + w, 23);
+      ctx.fillStyle = css("--text-2");
+      const txt = `O ${fmtAxis(b.o)}  H ${fmtAxis(b.h)}  L ${fmtAxis(b.l)}  C `;
+      ctx.fillText(txt, 14, 32);
+      const w = ctx.measureText(txt).width;
+      ctx.fillStyle = cc;
+      ctx.fillText(`${fmtAxis(b.c)} (${(chg * 100).toFixed(2)}%)`, 14 + w, 32);
     }
   }
 };
+function maybe(v) {
+  return v === void 0 ? "\u2014" : fmtAxis(v);
+}
 function fmtAxis(p) {
   if (p >= 1e3) return p.toLocaleString("en-US", { maximumFractionDigits: 0 });
   if (p >= 1) return p.toFixed(2);
   return p.toFixed(4);
+}
+function fmtTime(t) {
+  const d = new Date(t);
+  return d.toLocaleString("en-US", { month: "short", day: "numeric" });
 }
 
 // src/ui/canvas.ts
@@ -3406,29 +3498,31 @@ function renderShell() {
     </div>
     <div class="workspace">
       <nav class="sidebar" id="sidebar"></nav>
-      <div class="chart-area">
-        <div class="chart-toolbar" id="chartToolbar"></div>
-        <div class="chart-wrap">
-          <canvas id="chart"></canvas>
+      <main class="content">
+        <div class="trade-view">
+          <div class="chart-area">
+            <div class="chart-toolbar" id="chartToolbar"></div>
+            <div class="chart-wrap"><canvas id="chart"></canvas></div>
+            <div class="timebar">
+              <span class="time-label" id="timeLabel"></span>
+              <span class="mode-pill" id="modePill"></span>
+              <button class="adv-btn" data-adv="h">+1H</button>
+              <button class="adv-btn" data-adv="d">+1D</button>
+              <button class="adv-btn" data-adv="m">+30D</button>
+            </div>
+          </div>
+          <aside class="drawer" id="drawer">
+            <div class="drawer-header">
+              <div class="drawer-tabs" id="drawerTabs"></div>
+              <button class="drawer-close" id="drawerClose">\u2715</button>
+            </div>
+            <div class="drawer-body" id="drawerBody"></div>
+          </aside>
         </div>
-        <div class="timebar">
-          <span class="time-label" id="timeLabel"></span>
-          <span class="mode-pill" id="modePill"></span>
-          <button class="adv-btn" data-adv="h">+1H</button>
-          <button class="adv-btn" data-adv="d">+1D</button>
-          <button class="adv-btn" data-adv="m">+30D</button>
-        </div>
-      </div>
-      <aside class="drawer" id="drawer">
-        <div class="drawer-header">
-          <div class="drawer-tabs" id="drawerTabs"></div>
-          <button class="drawer-close" id="drawerClose">\u2715</button>
-        </div>
-        <div class="drawer-body" id="drawerBody"></div>
-      </aside>
+        <div id="overlay"></div>
+      </main>
     </div>
-    <div class="toast" id="toast"></div>
-    <div id="overlay"></div>`;
+    <div class="toast" id="toast"></div>`;
   chart = new Chart(document.getElementById("chart"));
   chart.setData(visibleBars(), { resetView: true });
   applyIndicators();
@@ -3439,6 +3533,7 @@ function renderShell() {
   renderDrawerBody();
   wireTime();
   wireDrawerClose();
+  if (state.screen !== "trade") mountScreen(state.screen);
   refresh();
 }
 function renderSidebar() {
@@ -3462,10 +3557,11 @@ function renderSidebar() {
       ${settingsIcon()}
       <span class="nav-tip">Settings</span>
     </button>`;
-  sidebar.querySelectorAll("[data-nav]").forEach((b) => b.onclick = () => openScreen(b.dataset.nav));
+  sidebar.querySelectorAll("[data-nav]").forEach((b) => b.onclick = () => navigate(b.dataset.nav));
 }
 function renderSymbolTabs() {
   const wrap = document.getElementById("topbarSyms");
+  if (!wrap) return;
   const bars = visibleBars();
   const last = bars[bars.length - 1];
   const prev = bars.length > 1 ? bars[bars.length - 2].c : last?.o ?? 0;
@@ -3488,8 +3584,9 @@ function renderSymbolTabs() {
 }
 function renderChartToolbar() {
   const toolbar = document.getElementById("chartToolbar");
+  if (!toolbar) return;
   const tfs = ["1m", "1h", "1d"];
-  const inds = [["bb", "BB"], ["sma", "SMA"], ["ema", "EMA"], ["vwap", "VWAP"]];
+  const inds = [["bb", "BB"], ["sma", "SMA 50"], ["ema", "EMA 20"], ["vwap", "VWAP"]];
   toolbar.innerHTML = `
     <div class="toolbar-group">
       ${tfs.map((t) => `<button class="toolbar-btn ${state.tf === t ? "active" : ""}" data-tf="${t}">${t.toUpperCase()}</button>`).join("")}
@@ -3512,7 +3609,6 @@ function renderChartToolbar() {
     applyIndicators();
   });
   document.getElementById("termBtn").onclick = openScanTab;
-  applyIndicators();
 }
 function applyIndicators() {
   if (!chart) return;
@@ -3520,6 +3616,7 @@ function applyIndicators() {
 }
 function renderDrawerTabs() {
   const tabs = document.getElementById("drawerTabs");
+  if (!tabs) return;
   const list = [
     { id: "trade", label: "Trade" },
     { id: "scan", label: "\u25C8 Scan" },
@@ -3536,6 +3633,7 @@ function renderDrawerTabs() {
 }
 function renderDrawerBody() {
   const body = document.getElementById("drawerBody");
+  if (!body) return;
   if (state.drawerTab === "trade") {
     body.innerHTML = ticketHTML();
     wireTicket();
@@ -3817,22 +3915,10 @@ function updateHeader() {
     const upnl = W().unrealized().toNumber();
     const totalPnl = eq - W().settings.startingCash;
     acctEl.innerHTML = `
-      <div class="acct-item">
-        <span class="k">Equity</span>
-        <span class="v num">${money(eq)}</span>
-      </div>
-      <div class="acct-item">
-        <span class="k">Buying Power</span>
-        <span class="v num">${money(bp)}</span>
-      </div>
-      <div class="acct-item">
-        <span class="k">Unrealized</span>
-        <span class="v num ${pnlClass(upnl)}">${money(upnl, { sign: true })}</span>
-      </div>
-      <div class="acct-item">
-        <span class="k">Total P&amp;L</span>
-        <span class="v num ${pnlClass(totalPnl)}">${money(totalPnl, { sign: true })}</span>
-      </div>`;
+      <div class="acct-item"><span class="k">Equity</span><span class="v num">${money(eq)}</span></div>
+      <div class="acct-item"><span class="k">Buying Power</span><span class="v num">${money(bp)}</span></div>
+      <div class="acct-item"><span class="k">Unrealized</span><span class="v num ${pnlClass(upnl)}">${money(upnl, { sign: true })}</span></div>
+      <div class="acct-item"><span class="k">Total P&amp;L</span><span class="v num ${pnlClass(totalPnl)}">${money(totalPnl, { sign: true })}</span></div>`;
   }
   const tl = document.getElementById("timeLabel");
   if (tl) tl.textContent = `\u25F7 ${dateLabel(W().now)}`;
@@ -3845,6 +3931,7 @@ function updateHeader() {
 }
 function refresh() {
   updateHeader();
+  renderSymbolTabs();
   if (state.drawerTab === "scan") {
     const body = document.getElementById("drawerBody");
     if (body) body.innerHTML = scanHTML();
@@ -3857,41 +3944,43 @@ function refresh() {
   } else {
     updatePreview();
   }
-  renderSymbolTabs();
 }
-function openScreen(s) {
-  const overlay = document.getElementById("overlay");
+function navigate(s) {
+  state.screen = s;
   if (s === "trade") {
-    state.screen = "trade";
-    overlay.innerHTML = "";
+    document.getElementById("overlay").innerHTML = "";
     if (window.innerWidth <= 900) {
       state.drawerOpen = true;
       document.getElementById("drawer").classList.add("open");
     }
+    chart.setData(visibleBars());
     renderSidebar();
+    refresh();
     return;
   }
-  state.screen = s;
+  mountScreen(s);
+  renderSidebar();
+}
+function mountScreen(s) {
   if (s === "options") renderOptionsScreen();
   else if (s === "stats") renderStatsScreen();
   else if (s === "learn") renderLearnScreen();
   else if (s === "settings") renderSettingsScreen();
-  renderSidebar();
 }
 function closeScreen() {
-  state.screen = "trade";
-  document.getElementById("overlay").innerHTML = "";
-  renderSidebar();
-  refresh();
+  navigate("trade");
 }
 function screenShell(title, body) {
   return `<div class="screen">
     <div class="shead">
-      <button class="back" id="backBtn">\u2039</button>
+      <button class="back" id="backBtn">\u2039 Back</button>
       <h2>${title}</h2>
     </div>
     <div class="sbody">${body}</div>
   </div>`;
+}
+function overlayEl() {
+  return document.getElementById("overlay");
 }
 function chainParams() {
   const spot = W().market.spotMark(sym(), W().now).toNumber();
@@ -3908,7 +3997,7 @@ function chainParams() {
   };
 }
 function renderOptionsScreen() {
-  const overlay = document.getElementById("overlay");
+  const overlay = overlayEl();
   const p = chainParams();
   const chain = buildChain(p, { strikes: 7 });
   state.optExpiryIdx = Math.min(state.optExpiryIdx, chain.expiries.length - 1);
@@ -4024,7 +4113,7 @@ function buildStrategy(name, exp, spot) {
   };
 }
 function renderStatsScreen() {
-  const overlay = document.getElementById("overlay");
+  const overlay = overlayEl();
   const r = analytics(W());
   const totalPnl = Number(r.totalPnl);
   const body = `
@@ -4075,7 +4164,7 @@ function stat(k, v, cls = "") {
   return `<div class="stat"><div class="k">${k}</div><div class="v num ${cls}">${v}</div></div>`;
 }
 function renderLearnScreen() {
-  const overlay = document.getElementById("overlay");
+  const overlay = overlayEl();
   if (!getCurriculum(W())) {
     overlay.innerHTML = screenShell("Learn", `<div class="empty" style="padding:24px">Help is disabled. Enable Help in Settings to access the learning track.</div>`);
     document.getElementById("backBtn").onclick = closeScreen;
@@ -4105,7 +4194,7 @@ function renderLearnScreen() {
   });
 }
 function renderModule(id) {
-  const overlay = document.getElementById("overlay");
+  const overlay = overlayEl();
   const m = CURRICULUM.find((x) => x.id === id);
   const answers = {};
   const body = `
@@ -4151,7 +4240,7 @@ function renderModule(id) {
   };
 }
 function renderSettingsScreen() {
-  const overlay = document.getElementById("overlay");
+  const overlay = overlayEl();
   const s = W().settings;
   const body = `
     <div class="card">
@@ -4183,12 +4272,16 @@ function renderSettingsScreen() {
       </div>
     </div>
     <div class="card">
-      <div class="set-row">
+      <div class="set-row" style="border-bottom:none;padding-bottom:6px">
         <div class="label">
           <div>Reset account</div>
-          <div class="sub">Wipe portfolio, orders and clock back to start.</div>
+          <div class="sub">Wipe portfolio, orders and clock back to the start, and set a fresh starting bankroll.</div>
         </div>
-        <button class="adv-btn" id="resetBtn" style="color:var(--loss);border-color:var(--loss)">Reset</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <label class="dim" style="font-size:12px">Starting bankroll</label>
+        <input class="input num" id="resetCash" style="max-width:160px" value="${Math.round(W().settings.startingCash)}">
+        <button class="adv-btn" id="resetBtn" style="color:var(--loss);border-color:var(--loss);margin-left:auto">Reset</button>
       </div>
     </div>
     <div class="card">
@@ -4219,11 +4312,12 @@ function renderSettingsScreen() {
     refresh();
   });
   document.getElementById("resetBtn").onclick = () => {
-    if (confirm("Reset your account? This wipes portfolio, orders and clock.")) {
-      store.reset();
+    const cash = Math.max(0, parseFloat(document.getElementById("resetCash").value) || W().settings.startingCash);
+    if (confirm(`Reset your account to a ${money(cash)} bankroll? This wipes portfolio, orders and clock.`)) {
+      store.reset(cash);
       state.screen = "trade";
       renderShell();
-      toast("Account reset");
+      toast(`Account reset \u2014 ${money(cash)} bankroll`);
     }
   };
 }
@@ -4243,6 +4337,7 @@ function onToggle(key) {
     store.ui.theme = store.ui.theme === "light" ? "dark" : "light";
     store.saveUi();
     document.documentElement.setAttribute("data-theme", store.ui.theme);
+    chart.setData(visibleBars());
   }
   renderSettingsScreen();
   refresh();

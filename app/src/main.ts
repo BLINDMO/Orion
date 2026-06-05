@@ -27,8 +27,10 @@ const store = new Store();
 const app = document.getElementById("app")!;
 let chart: Chart;
 
+type Screen = "trade" | "options" | "stats" | "learn" | "settings";
+
 const state = {
-  screen: "trade" as "trade" | "options" | "stats" | "learn" | "settings",
+  screen: "trade" as Screen,
   tf: "1h" as Resolution,
   form: { side: "buy" as Side, type: "market" as OrderType, qty: "", limit: "", stop: "", trail: "" },
   optExpiryIdx: 0,
@@ -78,6 +80,8 @@ function renderSplash() {
   };
 }
 
+// The shell is persistent: topbar + sidebar never unmount. Only #content swaps,
+// and overlay screens cover the content region only — the nav stays put.
 function renderShell() {
   app.innerHTML = `
     <div class="topbar">
@@ -88,29 +92,31 @@ function renderShell() {
     </div>
     <div class="workspace">
       <nav class="sidebar" id="sidebar"></nav>
-      <div class="chart-area">
-        <div class="chart-toolbar" id="chartToolbar"></div>
-        <div class="chart-wrap">
-          <canvas id="chart"></canvas>
+      <main class="content">
+        <div class="trade-view">
+          <div class="chart-area">
+            <div class="chart-toolbar" id="chartToolbar"></div>
+            <div class="chart-wrap"><canvas id="chart"></canvas></div>
+            <div class="timebar">
+              <span class="time-label" id="timeLabel"></span>
+              <span class="mode-pill" id="modePill"></span>
+              <button class="adv-btn" data-adv="h">+1H</button>
+              <button class="adv-btn" data-adv="d">+1D</button>
+              <button class="adv-btn" data-adv="m">+30D</button>
+            </div>
+          </div>
+          <aside class="drawer" id="drawer">
+            <div class="drawer-header">
+              <div class="drawer-tabs" id="drawerTabs"></div>
+              <button class="drawer-close" id="drawerClose">✕</button>
+            </div>
+            <div class="drawer-body" id="drawerBody"></div>
+          </aside>
         </div>
-        <div class="timebar">
-          <span class="time-label" id="timeLabel"></span>
-          <span class="mode-pill" id="modePill"></span>
-          <button class="adv-btn" data-adv="h">+1H</button>
-          <button class="adv-btn" data-adv="d">+1D</button>
-          <button class="adv-btn" data-adv="m">+30D</button>
-        </div>
-      </div>
-      <aside class="drawer" id="drawer">
-        <div class="drawer-header">
-          <div class="drawer-tabs" id="drawerTabs"></div>
-          <button class="drawer-close" id="drawerClose">✕</button>
-        </div>
-        <div class="drawer-body" id="drawerBody"></div>
-      </aside>
+        <div id="overlay"></div>
+      </main>
     </div>
-    <div class="toast" id="toast"></div>
-    <div id="overlay"></div>`;
+    <div class="toast" id="toast"></div>`;
 
   chart = new Chart(document.getElementById("chart") as HTMLCanvasElement);
   chart.setData(visibleBars(), { resetView: true });
@@ -123,6 +129,8 @@ function renderShell() {
   renderDrawerBody();
   wireTime();
   wireDrawerClose();
+  // Restore the active screen overlay if not on trade.
+  if (state.screen !== "trade") mountScreen(state.screen);
   refresh();
 }
 
@@ -130,7 +138,7 @@ function renderShell() {
 function renderSidebar() {
   const sidebar = document.getElementById("sidebar")!;
   const showLearn = W().settings.helpEnabled;
-  const items: [typeof state.screen, string, string][] = [
+  const items: [Screen, string, string][] = [
     ["trade", "Trade", tradeIcon()],
     ["options", "Options", optionsIcon()],
     ["stats", "Statistics", statsIcon()],
@@ -151,12 +159,13 @@ function renderSidebar() {
     </button>`;
 
   sidebar.querySelectorAll<HTMLElement>("[data-nav]").forEach((b) =>
-    b.onclick = () => openScreen(b.dataset.nav as typeof state.screen));
+    b.onclick = () => navigate(b.dataset.nav as Screen));
 }
 
 // ─── Symbol Tabs ────────────────────────────────────
 function renderSymbolTabs() {
-  const wrap = document.getElementById("topbarSyms")!;
+  const wrap = document.getElementById("topbarSyms");
+  if (!wrap) return;
   const bars = visibleBars();
   const last = bars[bars.length - 1];
   const prev = bars.length > 1 ? bars[bars.length - 2]!.c : last?.o ?? 0;
@@ -182,9 +191,10 @@ function renderSymbolTabs() {
 
 // ─── Chart Toolbar ───────────────────────────────────
 function renderChartToolbar() {
-  const toolbar = document.getElementById("chartToolbar")!;
+  const toolbar = document.getElementById("chartToolbar");
+  if (!toolbar) return;
   const tfs: Resolution[] = ["1m", "1h", "1d"];
-  const inds: [keyof typeof ind, string][] = [["bb", "BB"], ["sma", "SMA"], ["ema", "EMA"], ["vwap", "VWAP"]];
+  const inds: [keyof typeof ind, string][] = [["bb", "BB"], ["sma", "SMA 50"], ["ema", "EMA 20"], ["vwap", "VWAP"]];
 
   toolbar.innerHTML = `
     <div class="toolbar-group">
@@ -209,7 +219,6 @@ function renderChartToolbar() {
     applyIndicators();
   });
   document.getElementById("termBtn")!.onclick = openScanTab;
-  applyIndicators();
 }
 
 function applyIndicators() {
@@ -219,7 +228,8 @@ function applyIndicators() {
 
 // ─── Drawer ──────────────────────────────────────────
 function renderDrawerTabs() {
-  const tabs = document.getElementById("drawerTabs")!;
+  const tabs = document.getElementById("drawerTabs");
+  if (!tabs) return;
   const list = [
     { id: "trade", label: "Trade" },
     { id: "scan", label: "◈ Scan" },
@@ -236,7 +246,8 @@ function renderDrawerTabs() {
 }
 
 function renderDrawerBody() {
-  const body = document.getElementById("drawerBody")!;
+  const body = document.getElementById("drawerBody");
+  if (!body) return;
   if (state.drawerTab === "trade") {
     body.innerHTML = ticketHTML();
     wireTicket();
@@ -300,7 +311,7 @@ function wireTicket() {
     state.form.side = b.dataset.side as Side;
     renderDrawerBody();
   });
-  const typeSel = document.getElementById("typeSel") as HTMLSelectElement;
+  const typeSel = document.getElementById("typeSel") as HTMLSelectElement | null;
   if (typeSel) typeSel.onchange = () => { state.form.type = typeSel.value as OrderType; renderDrawerBody(); };
   for (const id of ["qty", "limit", "stop", "trail"] as const) {
     const e = document.getElementById(id) as HTMLInputElement | null;
@@ -520,7 +531,6 @@ function setAdvButtons(on: boolean) {
 
 // ─── Header update ───────────────────────────────────
 function updateHeader() {
-  // Price display
   const priceEl = document.getElementById("topbarPrice");
   const bars = visibleBars();
   if (priceEl && bars.length) {
@@ -532,7 +542,6 @@ function updateHeader() {
       <div class="chg num ${F.pnlClass(chg)}">${F.glyph(chg)} ${F.pct(chg)}</div>`;
   }
 
-  // Account bar
   const acctEl = document.getElementById("topbarAcct");
   if (acctEl) {
     const eq = W().equity().toNumber();
@@ -540,25 +549,12 @@ function updateHeader() {
     const upnl = W().unrealized().toNumber();
     const totalPnl = eq - W().settings.startingCash;
     acctEl.innerHTML = `
-      <div class="acct-item">
-        <span class="k">Equity</span>
-        <span class="v num">${F.money(eq)}</span>
-      </div>
-      <div class="acct-item">
-        <span class="k">Buying Power</span>
-        <span class="v num">${F.money(bp)}</span>
-      </div>
-      <div class="acct-item">
-        <span class="k">Unrealized</span>
-        <span class="v num ${F.pnlClass(upnl)}">${F.money(upnl, { sign: true })}</span>
-      </div>
-      <div class="acct-item">
-        <span class="k">Total P&amp;L</span>
-        <span class="v num ${F.pnlClass(totalPnl)}">${F.money(totalPnl, { sign: true })}</span>
-      </div>`;
+      <div class="acct-item"><span class="k">Equity</span><span class="v num">${F.money(eq)}</span></div>
+      <div class="acct-item"><span class="k">Buying Power</span><span class="v num">${F.money(bp)}</span></div>
+      <div class="acct-item"><span class="k">Unrealized</span><span class="v num ${F.pnlClass(upnl)}">${F.money(upnl, { sign: true })}</span></div>
+      <div class="acct-item"><span class="k">Total P&amp;L</span><span class="v num ${F.pnlClass(totalPnl)}">${F.money(totalPnl, { sign: true })}</span></div>`;
   }
 
-  // Time + mode
   const tl = document.getElementById("timeLabel");
   if (tl) tl.textContent = `◷ ${F.dateLabel(W().now)}`;
   const mp = document.getElementById("modePill");
@@ -571,6 +567,7 @@ function updateHeader() {
 
 function refresh() {
   updateHeader();
+  renderSymbolTabs();
   if (state.drawerTab === "scan") {
     const body = document.getElementById("drawerBody");
     if (body) body.innerHTML = scanHTML();
@@ -580,48 +577,46 @@ function refresh() {
   } else {
     updatePreview();
   }
-  // Keep symbol tab changes up to date
-  renderSymbolTabs();
 }
 
-// ─── Screen overlays ─────────────────────────────────
-function openScreen(s: typeof state.screen) {
-  const overlay = document.getElementById("overlay")!;
+// ─── Navigation: screens mount into the content overlay only ──
+function navigate(s: Screen) {
+  state.screen = s;
   if (s === "trade") {
-    state.screen = "trade";
-    overlay.innerHTML = "";
-    // On mobile, open drawer
+    document.getElementById("overlay")!.innerHTML = "";
     if (window.innerWidth <= 900) {
       state.drawerOpen = true;
       document.getElementById("drawer")!.classList.add("open");
     }
+    chart.setData(visibleBars());
     renderSidebar();
+    refresh();
     return;
   }
-  state.screen = s;
+  mountScreen(s);
+  renderSidebar();
+}
+
+function mountScreen(s: Screen) {
   if (s === "options") renderOptionsScreen();
   else if (s === "stats") renderStatsScreen();
   else if (s === "learn") renderLearnScreen();
   else if (s === "settings") renderSettingsScreen();
-  renderSidebar();
 }
 
-function closeScreen() {
-  state.screen = "trade";
-  document.getElementById("overlay")!.innerHTML = "";
-  renderSidebar();
-  refresh();
-}
+function closeScreen() { navigate("trade"); }
 
 function screenShell(title: string, body: string): string {
   return `<div class="screen">
     <div class="shead">
-      <button class="back" id="backBtn">‹</button>
+      <button class="back" id="backBtn">‹ Back</button>
       <h2>${title}</h2>
     </div>
     <div class="sbody">${body}</div>
   </div>`;
 }
+
+function overlayEl() { return document.getElementById("overlay")!; }
 
 // ─── Options Screen ───────────────────────────────────
 function chainParams() {
@@ -635,7 +630,7 @@ function chainParams() {
 }
 
 function renderOptionsScreen() {
-  const overlay = document.getElementById("overlay")!;
+  const overlay = overlayEl();
   const p = chainParams();
   const chain = buildChain(p, { strikes: 7 });
   state.optExpiryIdx = Math.min(state.optExpiryIdx, chain.expiries.length - 1);
@@ -754,7 +749,7 @@ function buildStrategy(name: string, exp: ReturnType<typeof buildChain>["expirie
 
 // ─── Stats Screen ─────────────────────────────────────
 function renderStatsScreen() {
-  const overlay = document.getElementById("overlay")!;
+  const overlay = overlayEl();
   const r = analytics(W());
   const totalPnl = Number(r.totalPnl);
   const body = `
@@ -810,7 +805,7 @@ function stat(k: string, v: string, cls = "") {
 
 // ─── Learn Screen ─────────────────────────────────────
 function renderLearnScreen() {
-  const overlay = document.getElementById("overlay")!;
+  const overlay = overlayEl();
   if (!getCurriculum(W())) {
     overlay.innerHTML = screenShell("Learn", `<div class="empty" style="padding:24px">Help is disabled. Enable Help in Settings to access the learning track.</div>`);
     document.getElementById("backBtn")!.onclick = closeScreen;
@@ -841,7 +836,7 @@ function renderLearnScreen() {
 }
 
 function renderModule(id: string) {
-  const overlay = document.getElementById("overlay")!;
+  const overlay = overlayEl();
   const m = CURRICULUM.find((x) => x.id === id)!;
   const answers: Record<string, number> = {};
   const body = `
@@ -887,7 +882,7 @@ function renderModule(id: string) {
 
 // ─── Settings Screen ──────────────────────────────────
 function renderSettingsScreen() {
-  const overlay = document.getElementById("overlay")!;
+  const overlay = overlayEl();
   const s = W().settings;
   const body = `
     <div class="card">
@@ -919,12 +914,16 @@ function renderSettingsScreen() {
       </div>
     </div>
     <div class="card">
-      <div class="set-row">
+      <div class="set-row" style="border-bottom:none;padding-bottom:6px">
         <div class="label">
           <div>Reset account</div>
-          <div class="sub">Wipe portfolio, orders and clock back to start.</div>
+          <div class="sub">Wipe portfolio, orders and clock back to the start, and set a fresh starting bankroll.</div>
         </div>
-        <button class="adv-btn" id="resetBtn" style="color:var(--loss);border-color:var(--loss)">Reset</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <label class="dim" style="font-size:12px">Starting bankroll</label>
+        <input class="input num" id="resetCash" style="max-width:160px" value="${Math.round(W().settings.startingCash)}">
+        <button class="adv-btn" id="resetBtn" style="color:var(--loss);border-color:var(--loss);margin-left:auto">Reset</button>
       </div>
     </div>
     <div class="card">
@@ -951,11 +950,12 @@ function renderSettingsScreen() {
     refresh();
   });
   document.getElementById("resetBtn")!.onclick = () => {
-    if (confirm("Reset your account? This wipes portfolio, orders and clock.")) {
-      store.reset();
+    const cash = Math.max(0, parseFloat((document.getElementById("resetCash") as HTMLInputElement).value) || W().settings.startingCash);
+    if (confirm(`Reset your account to a ${F.money(cash)} bankroll? This wipes portfolio, orders and clock.`)) {
+      store.reset(cash);
       state.screen = "trade";
       renderShell();
-      toast("Account reset");
+      toast(`Account reset — ${F.money(cash)} bankroll`);
     }
   };
 }
@@ -975,6 +975,7 @@ function onToggle(key: string) {
     store.ui.theme = store.ui.theme === "light" ? "dark" : "light";
     store.saveUi();
     document.documentElement.setAttribute("data-theme", store.ui.theme);
+    chart.setData(visibleBars()); // repaint with new palette
   }
   renderSettingsScreen();
   refresh();
@@ -990,7 +991,6 @@ function toast(msg: string, cls = "") {
 
 function ceilTo(t: number, step: number) { return Math.ceil(t / step) * step; }
 
-// Brand elements
 function brandLogoLarge(): string {
   return `<svg class="splash-logo" width="64" height="64" viewBox="0 0 24 24" fill="none">
     <circle cx="5" cy="17" r="2" fill="var(--accent)"/>
@@ -1012,7 +1012,6 @@ function brandMark(): string {
   </div>`;
 }
 
-// Nav icons (SVG)
 function tradeIcon() {
   return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
     <line x1="7" y1="4" x2="7" y2="6.5"/>
