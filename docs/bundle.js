@@ -4239,7 +4239,7 @@ function renderBookScreen() {
   const positions = [...W().portfolio.positions.values()];
   const wo = W().workingOrders();
   const fills = W().fills.slice(-12).reverse();
-  const posHTML = positions.length === 0 ? `<div class="empty">No open positions.</div>` : positions.map((p) => {
+  const posHTML = positions.length === 0 ? `<div class="empty"><svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="6" width="18" height="15" rx="2"/><path d="M3 10h18M8 6V4a2 2 0 014 0v2"/></svg>No open positions.</div>` : positions.map((p) => {
     const mark = resolve(p)?.toNumber() ?? 0;
     const upnl2 = W().portfolio.unrealized(p, resolve).toNumber();
     const isOpt = p.target.kind === "option" && p.option;
@@ -4257,14 +4257,14 @@ function renderBookScreen() {
           ${isOpt ? `<button class="exec-btn" data-close="${p.key}">Execute</button>` : `<button class="action-btn close-btn" data-close="${p.key}">Close</button>`}
         </div>`;
   }).join("");
-  const ordersHTML = wo.length === 0 ? `<div class="empty">No working orders.</div>` : wo.map((o) => `<div class="book-row">
+  const ordersHTML = wo.length === 0 ? `<div class="empty"><svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>No working orders.</div>` : wo.map((o) => `<div class="book-row">
         <div class="book-info">
           <div class="book-sym">${o.side.toUpperCase()} ${qty(o.qty - o.filledQty)} ${(o.target.option?.underlying ?? o.target.symbol).replace("-USD", "")}</div>
           <div class="sub-text">${o.type}${o.limitPrice ? " @ " + priceFmt(o.limitPrice) : ""}${o.stopPrice ? " stop " + priceFmt(o.stopPrice) : ""}</div>
         </div>
         <button class="action-btn cancel-btn" data-cancel="${o.id}">Cancel</button>
       </div>`).join("");
-  const blotterHTML = fills.length === 0 ? `<div class="empty">No fills yet.</div>` : fills.map((f) => `<div class="book-row">
+  const blotterHTML = fills.length === 0 ? `<div class="empty"><svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>No fills yet.</div>` : fills.map((f) => `<div class="book-row">
         <div class="book-info">
           <div class="book-sym">${f.side.toUpperCase()} ${qty(f.qty)} ${(f.target.option?.underlying ?? f.target.symbol).replace("-USD", "")}</div>
           <div class="sub-text">${dateLabel(f.at)}</div>

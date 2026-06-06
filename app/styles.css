@@ -131,6 +131,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; bo
   background: var(--ink-elev);
   overflow-x: auto; scrollbar-width: none;
   flex-shrink: 0; -webkit-overflow-scrolling: touch;
+  /* Fade right edge to hint at scrollability */
+  mask-image: linear-gradient(to right, black 85%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to right, black 85%, transparent 100%);
 }
 .ticker::-webkit-scrollbar { display: none; }
 .ticker-item {
@@ -198,8 +201,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; bo
   align-items: center; justify-content: center; gap: 3px;
   color: var(--text-3);
   font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
-  transition: color 0.14s; position: relative;
+  transition: color 0.14s, transform 0.1s; position: relative;
 }
+.bn-btn:active { transform: scale(0.92); }
 .bn-icon { display: flex; align-items: center; justify-content: center; }
 .bn-icon svg { width: 21px; height: 21px; }
 .bn-btn.active { color: var(--accent); }
@@ -247,11 +251,13 @@ canvas { display: block; }
 .qb-btn {
   padding: 9px 24px; border-radius: var(--r-md);
   font-size: 13px; font-weight: 700; letter-spacing: 0.02em;
-  color: #fff; transition: filter 0.12s, transform 0.1s;
+  color: #fff; transition: filter 0.1s, transform 0.1s, box-shadow 0.1s;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25);
 }
 .qb-btn.buy { background: var(--gain); }
 .qb-btn.sell { background: var(--loss); }
-.qb-btn:active { transform: scale(0.96); }
+.qb-btn:hover { filter: brightness(1.08); }
+.qb-btn:active { transform: scale(0.95); box-shadow: none; }
 
 .chart-wrap { flex: 1; position: relative; min-height: 0; overflow: hidden; background: var(--ink); }
 #chart { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
@@ -353,7 +359,7 @@ canvas { display: block; }
 .seg.buy button.on { background: var(--gain-subtle); color: var(--gain); }
 .seg.sell button.on { background: var(--loss-subtle); color: var(--loss); }
 .field { margin-top: 13px; }
-.field label { display: block; font-size: 10px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 5px; }
+.field label { display: block; font-size: 11px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 7px; line-height: 1.4; }
 .input {
   width: 100%; padding: 11px 13px;
   background: var(--surface); border: 1px solid var(--hairline);
@@ -463,7 +469,13 @@ select.input { font-family: var(--font); font-size: 13px; cursor: pointer; }
 .close-btn:active { background: var(--loss-subtle); }
 .cancel-btn { color: var(--text-2); border-color: var(--hairline); }
 .cancel-btn:active { background: var(--surface-2); }
-.empty { color: var(--text-3); font-size: 12px; padding: 14px; text-align: center; background: var(--surface); border: 1px dashed var(--hairline); border-radius: var(--r-lg); }
+.empty {
+  color: var(--text-3); font-size: 12px; padding: 20px 14px;
+  text-align: center; background: var(--surface);
+  border: 1px dashed var(--hairline); border-radius: var(--r-lg);
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.empty-icon { width: 28px; height: 28px; opacity: 0.4; }
 
 /* Cards & stats */
 .card { background: var(--surface); border: 1px solid var(--hairline); border-radius: var(--r-xl); padding: 15px; margin-bottom: 11px; }
@@ -498,8 +510,9 @@ table.chain td { padding: 11px 4px; text-align: center; border-bottom: 1px solid
 table.chain td.strike { font-weight: 700; color: var(--text-1); }
 table.chain tr.atm td.strike { color: var(--accent); }
 table.chain td.itm { background: var(--accent-subtle); }
-table.chain .buyc { color: var(--text-1); cursor: pointer; font-weight: 600; }
-table.chain .buyc:active { color: var(--gain); }
+table.chain .buyc { color: var(--text-1); cursor: pointer; font-weight: 600; transition: color 0.1s; border-radius: var(--r-sm); }
+table.chain .buyc:hover { color: var(--accent); }
+table.chain .buyc:active { color: var(--gain); transform: scale(0.98); }
 
 /* Learn */
 .module { background: var(--surface); border: 1px solid var(--hairline); border-radius: var(--r-xl); padding: 15px; margin-bottom: 10px; cursor: pointer; transition: border-color 0.12s; }
