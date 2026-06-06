@@ -775,12 +775,12 @@ function barsPerYear(calendar, resolutionMinutes) {
   return 252 * 6.5 * 60 / resolutionMinutes;
 }
 var SEED_SPECS = {
-  "BTC-USD": { seed: 1001, startPrice: 96e3, driftAnnual: 0.35, volAnnual: 0.55 },
-  "ETH-USD": { seed: 1002, startPrice: 3400, driftAnnual: 0.3, volAnnual: 0.7 },
-  "SOL-USD": { seed: 1003, startPrice: 165, driftAnnual: 0.5, volAnnual: 0.95 },
-  ACME: { seed: 2001, startPrice: 240, driftAnnual: 0.1, volAnnual: 0.28 },
-  NOVA: { seed: 2002, startPrice: 420, driftAnnual: 0.12, volAnnual: 0.35 },
-  ORN: { seed: 2003, startPrice: 130, driftAnnual: 0.18, volAnnual: 0.45 }
+  "BTC-USD": { seed: 1001, startPrice: 74824, driftAnnual: 0.2, volAnnual: 0.55 },
+  "ETH-USD": { seed: 1002, startPrice: 1728, driftAnnual: 0.2, volAnnual: 0.7 },
+  "SOL-USD": { seed: 1003, startPrice: 56.8, driftAnnual: 0.3, volAnnual: 0.95 },
+  ACME: { seed: 2001, startPrice: 210, driftAnnual: 0.1, volAnnual: 0.28 },
+  NOVA: { seed: 2002, startPrice: 380, driftAnnual: 0.12, volAnnual: 0.35 },
+  ORN: { seed: 2003, startPrice: 118, driftAnnual: 0.18, volAnnual: 0.45 }
 };
 var MINUTE_WINDOW_DAYS = 90;
 function buildSeedData(start, days = 540) {
@@ -3885,9 +3885,8 @@ function tradeViewHTML() {
     <div class="timebar">
       <span class="time-label" id="timeLabel"></span>
       <span class="mode-pill" id="modePill"></span>
-      <button class="adv-btn" data-adv="h">+1H</button>
-      <button class="adv-btn" data-adv="d">+1D</button>
-      <button class="adv-btn" data-adv="m">+30D</button>
+      <span class="warp-rate hidden" id="warpRate">6h/s</span>
+      <button class="warp-btn" id="warpBtn" title="Time warp \u2014 6 simulated hours/sec. Tap again to stop.">+</button>
     </div>
   </div>`;
 }
@@ -3924,6 +3923,7 @@ function renderNav() {
   }
 }
 function navigate(s) {
+  stopWarp();
   closeSheets();
   state.screen = s;
   if (s === "trade") {
@@ -4254,7 +4254,7 @@ function renderBookScreen() {
             <div class="book-mark num">${priceFmt(mark)}</div>
             <div class="pnl num ${pnlClass(upnl2)}">${money(upnl2, { sign: true })}</div>
           </div>
-          <button class="action-btn close-btn" data-close="${p.key}">Close</button>
+          ${isOpt ? `<button class="exec-btn" data-close="${p.key}">Execute</button>` : `<button class="action-btn close-btn" data-close="${p.key}">Close</button>`}
         </div>`;
   }).join("");
   const ordersHTML = wo.length === 0 ? `<div class="empty">No working orders.</div>` : wo.map((o) => `<div class="book-row">
@@ -4320,58 +4320,44 @@ function closePosition(key) {
   toast(W().mode === "live" ? "Position closed" : "Close order placed \u2014 fills next bar", "gain");
   refresh();
 }
-function wireTime() {
-  document.querySelectorAll("[data-adv]").forEach((b) => b.onclick = () => {
-    if (state.scrubbing) return;
-    if (store.live) {
-      toast("Turn off live mode to scrub time");
-      return;
-    }
-    const kind = b.dataset.adv;
-    const from = W().now;
-    let target = from;
-    if (kind === "h") target = ceilTo(from + 36e5, 36e5);
-    else if (kind === "d") target = from + 864e5;
-    else target = from + 30 * 864e5;
-    animateAdvance(from, target);
-  });
-}
-function animateAdvance(from, target) {
-  state.scrubbing = true;
-  app.classList.add("scrubbing");
-  setAdvButtons(false);
-  const span = target - from;
-  const stepRes = span > 2 * 864e5 ? "1h" : "1m";
-  const barMs = stepRes === "1h" ? 36e5 : 6e4;
-  const maxBarsPerFrame = 24;
-  const dur = 800;
-  const t0 = performance.now();
-  const ease = (k) => k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
-  function frame(now) {
-    const k = Math.min(1, (now - t0) / dur);
-    let want = from + span * ease(k);
-    const cap = W().now + maxBarsPerFrame * barMs;
-    if (want > cap) want = cap;
-    if (want > W().now) W().advanceTo(want, { stepRes });
+var warp = { on: false, raf: 0, lastTs: 0 };
+var WARP_HRS_PER_SEC = 6;
+function toggleWarp() {
+  if (warp.on) {
+    stopWarp();
+    return;
+  }
+  if (store.live) {
+    toast("Turn off live mode to use time warp");
+    return;
+  }
+  warp.on = true;
+  warp.lastTs = performance.now();
+  document.getElementById("warpBtn")?.classList.add("on");
+  document.getElementById("warpRate")?.classList.remove("hidden");
+  function frame(ts) {
+    if (!warp.on) return;
+    const dt = (ts - warp.lastTs) / 1e3;
+    warp.lastTs = ts;
+    W().advanceTo(W().now + dt * WARP_HRS_PER_SEC * 36e5, { stepRes: "1h" });
     chart?.setData(visibleBars());
     updateHeader();
-    if (W().now < target) requestAnimationFrame(frame);
-    else finishAdvance(target);
+    warp.raf = requestAnimationFrame(frame);
   }
-  requestAnimationFrame(frame);
+  warp.raf = requestAnimationFrame(frame);
 }
-function finishAdvance(target) {
-  if (target > W().now) W().advanceTo(target);
-  store.noteAdvance(target);
-  state.scrubbing = false;
-  app.classList.remove("scrubbing");
-  setAdvButtons(true);
-  chart?.setData(visibleBars());
+function stopWarp() {
+  if (!warp.on) return;
+  cancelAnimationFrame(warp.raf);
+  warp.on = false;
+  document.getElementById("warpBtn")?.classList.remove("on");
+  document.getElementById("warpRate")?.classList.add("hidden");
+  store.noteAdvance(W().now);
+  chart?.setData(visibleBars(), { resetView: false });
   refresh();
-  toast(`Advanced to ${dayLabel(W().now)}`);
 }
-function setAdvButtons(on) {
-  document.querySelectorAll("[data-adv]").forEach((b) => b.disabled = !on);
+function wireTime() {
+  document.getElementById("warpBtn")?.addEventListener("click", toggleWarp);
 }
 function updateHeader() {
   const cash = W().portfolio.cash.toNumber();
@@ -4489,7 +4475,7 @@ function renderOptionsScreen() {
           <div class="book-mark num">${priceFmt(mark)}</div>
           <div class="pnl num ${pnlClass(upnl)}">${money(upnl, { sign: true })}</div>
         </div>
-        <button class="action-btn close-btn" data-close="${pos.key}">Close</button>
+        <button class="exec-btn" data-close="${pos.key}">Execute</button>
       </div>`;
   }).join("")}`;
   const rows = exp.calls.map((c) => c.spec.strike).map((k) => {
@@ -4794,9 +4780,6 @@ function toast(msg, cls = "") {
   t.className = `toast show ${cls}`;
   t.textContent = msg;
   setTimeout(() => t.className = "toast", 2400);
-}
-function ceilTo(t, step) {
-  return Math.ceil(t / step) * step;
 }
 function brandLogoLarge() {
   return `<svg class="splash-logo" width="64" height="64" viewBox="0 0 24 24" fill="none">

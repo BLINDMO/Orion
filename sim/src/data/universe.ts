@@ -86,13 +86,16 @@ export function barsPerYear(calendar: "24x7" | "us-equity", resolutionMinutes: n
   return (252 * 6.5 * 60) / resolutionMinutes;
 }
 
+// Start prices are back-calculated so the opening mark (day 25, the first
+// "now" the user sees) lands on realistic June 2026 market levels despite
+// 25 days of deterministic GBM drift: BTC ~$66.5k, ETH ~$1.85k, SOL ~$65.
 const SEED_SPECS: Record<string, Partial<SyntheticSpec>> = {
-  "BTC-USD": { seed: 1001, startPrice: 96000, driftAnnual: 0.35, volAnnual: 0.55 },
-  "ETH-USD": { seed: 1002, startPrice: 3400, driftAnnual: 0.3, volAnnual: 0.7 },
-  "SOL-USD": { seed: 1003, startPrice: 165, driftAnnual: 0.5, volAnnual: 0.95 },
-  ACME: { seed: 2001, startPrice: 240, driftAnnual: 0.1, volAnnual: 0.28 },
-  NOVA: { seed: 2002, startPrice: 420, driftAnnual: 0.12, volAnnual: 0.35 },
-  ORN: { seed: 2003, startPrice: 130, driftAnnual: 0.18, volAnnual: 0.45 },
+  "BTC-USD": { seed: 1001, startPrice: 74824, driftAnnual: 0.2, volAnnual: 0.55 },
+  "ETH-USD": { seed: 1002, startPrice: 1728, driftAnnual: 0.2, volAnnual: 0.7 },
+  "SOL-USD": { seed: 1003, startPrice: 56.8, driftAnnual: 0.3, volAnnual: 0.95 },
+  ACME: { seed: 2001, startPrice: 210, driftAnnual: 0.1, volAnnual: 0.28 },
+  NOVA: { seed: 2002, startPrice: 380, driftAnnual: 0.12, volAnnual: 0.35 },
+  ORN: { seed: 2003, startPrice: 118, driftAnnual: 0.18, volAnnual: 0.45 },
 };
 
 /** Hours of 1-minute detail generated from `start` (covers history + near future

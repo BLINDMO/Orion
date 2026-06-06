@@ -227,9 +227,8 @@ function tradeViewHTML(): string {
     <div class="timebar">
       <span class="time-label" id="timeLabel"></span>
       <span class="mode-pill" id="modePill"></span>
-      <button class="adv-btn" data-adv="h">+1H</button>
-      <button class="adv-btn" data-adv="d">+1D</button>
-      <button class="adv-btn" data-adv="m">+30D</button>
+      <span class="warp-rate hidden" id="warpRate">6h/s</span>
+      <button class="warp-btn" id="warpBtn" title="Time warp — 6 simulated hours/sec. Tap again to stop.">+</button>
     </div>
   </div>`;
 }
@@ -269,6 +268,7 @@ function renderNav() {
 }
 
 function navigate(s: Screen) {
+  stopWarp();
   closeSheets();
   state.screen = s;
   if (s === "trade") {
@@ -609,7 +609,9 @@ function renderBookScreen() {
             <div class="book-mark num">${F.priceFmt(mark)}</div>
             <div class="pnl num ${F.pnlClass(upnl)}">${F.money(upnl, { sign: true })}</div>
           </div>
-          <button class="action-btn close-btn" data-close="${p.key}">Close</button>
+          ${isOpt
+            ? `<button class="exec-btn" data-close="${p.key}">Execute</button>`
+            : `<button class="action-btn close-btn" data-close="${p.key}">Close</button>`}
         </div>`;
       }).join("");
 
@@ -682,18 +684,42 @@ function closePosition(key: string) {
 }
 
 // ─── Time Controls ────────────────────────────────────────────────────────────
+// Warp state — continuous rAF loop advancing 6 sim-hours per real second.
+const warp = { on: false, raf: 0, lastTs: 0 };
+const WARP_HRS_PER_SEC = 6;
+
+function toggleWarp() {
+  if (warp.on) { stopWarp(); return; }
+  if (store.live) { toast("Turn off live mode to use time warp"); return; }
+  warp.on = true;
+  warp.lastTs = performance.now();
+  document.getElementById("warpBtn")?.classList.add("on");
+  document.getElementById("warpRate")?.classList.remove("hidden");
+  function frame(ts: number) {
+    if (!warp.on) return;
+    const dt = (ts - warp.lastTs) / 1000;
+    warp.lastTs = ts;
+    W().advanceTo(W().now + dt * WARP_HRS_PER_SEC * 3_600_000, { stepRes: "1h" });
+    chart?.setData(visibleBars());
+    updateHeader();
+    warp.raf = requestAnimationFrame(frame);
+  }
+  warp.raf = requestAnimationFrame(frame);
+}
+
+function stopWarp() {
+  if (!warp.on) return;
+  cancelAnimationFrame(warp.raf);
+  warp.on = false;
+  document.getElementById("warpBtn")?.classList.remove("on");
+  document.getElementById("warpRate")?.classList.add("hidden");
+  store.noteAdvance(W().now);
+  chart?.setData(visibleBars(), { resetView: false });
+  refresh();
+}
+
 function wireTime() {
-  document.querySelectorAll<HTMLElement>("[data-adv]").forEach((b) => b.onclick = () => {
-    if (state.scrubbing) return;
-    if (store.live) { toast("Turn off live mode to scrub time"); return; }
-    const kind = b.dataset.adv!;
-    const from = W().now;
-    let target = from;
-    if (kind === "h") target = ceilTo(from + 3600_000, 3600_000);
-    else if (kind === "d") target = from + 86400_000;
-    else target = from + 30 * 86400_000;
-    animateAdvance(from, target);
-  });
+  document.getElementById("warpBtn")?.addEventListener("click", toggleWarp);
 }
 
 function animateAdvance(from: number, target: number) {
@@ -844,7 +870,7 @@ function renderOptionsScreen() {
           <div class="book-mark num">${F.priceFmt(mark)}</div>
           <div class="pnl num ${F.pnlClass(upnl)}">${F.money(upnl, { sign: true })}</div>
         </div>
-        <button class="action-btn close-btn" data-close="${pos.key}">Close</button>
+        <button class="exec-btn" data-close="${pos.key}">Execute</button>
       </div>`;
     }).join("")}`;
 
