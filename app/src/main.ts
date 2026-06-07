@@ -78,11 +78,15 @@ function visibleBars(s = sym()) {
 }
 
 function lastAndChange(s: string): { last: number | null; chg: number } {
+  // Display the live MARK (freshest close across resolutions) — the same value
+  // positions are marked at — so the quoted price and P&L never disagree.
+  const markDec = W().market.spotMark(s, W().now);
   const bars = visibleBars(s);
-  if (!bars.length) return { last: null, chg: 0 };
-  const last = bars[bars.length - 1]!;
-  const prev = bars.length > 1 ? bars[bars.length - 2]!.c : last.o;
-  return { last: last.c, chg: prev ? (last.c - prev) / prev : 0 };
+  const fallback = bars.length ? bars[bars.length - 1]!.c : null;
+  const last = markDec ? markDec.toNumber() : fallback;
+  if (last === null || !bars.length) return { last, chg: 0 };
+  const prev = bars.length > 1 ? bars[bars.length - 2]!.c : bars[bars.length - 1]!.o;
+  return { last, chg: prev ? (last - prev) / prev : 0 };
 }
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
@@ -423,12 +427,44 @@ function openOptionTicket(q: OptionQuote) {
   state.form.option = { spec: q.spec, bid: q.bid, ask: q.ask, mid };
   state.form.side = "buy";
   state.form.type = "market";
-  state.form.qty = "1";
+  // Default to a size the account can actually afford (one contract if it fits,
+  // otherwise a sensible fraction) so small bankrolls can still practice options.
+  const perContract = q.ask * q.spec.multiplier;
+  const bp = W().buyingPower().toNumber();
+  let defaultQty = 1;
+  if (perContract > bp && perContract > 0) {
+    defaultQty = Math.max(0.01, Math.floor((bp / perContract) * 100) / 100);
+  }
+  state.form.qty = String(defaultQty);
   const label = `${q.spec.underlying.replace("-USD", "")} ${F.priceFmt(q.spec.strike)}${q.spec.right[0]!.toUpperCase()}`;
   document.getElementById("ticketTitle")!.textContent = label;
   renderTicketBody();
   openSheet("ticketSheet");
   focusQty();
+}
+
+// Quick-size chips for the option ticket: fractions of the max affordable size.
+function renderOptChips(perContract: number, bp: number): void {
+  const wrap = document.getElementById("optChips");
+  if (!wrap) return;
+  const max = perContract > 0 ? (bp / perContract) : 0;
+  const sizes: [string, number][] = [
+    ["0.1", 0.1],
+    ["0.25", 0.25],
+    ["0.5", 0.5],
+    ["1", 1],
+    ["Max", Math.floor(max * 100) / 100],
+  ];
+  wrap.innerHTML = sizes
+    .filter(([, v]) => v > 0 && v <= Math.max(1, max) + 1e-9)
+    .map(([label, v]) => `<button class="qty-chip" data-qty="${v}">${label}</button>`)
+    .join("");
+  wrap.querySelectorAll<HTMLElement>("[data-qty]").forEach((b) => b.onclick = () => {
+    state.form.qty = b.dataset.qty!;
+    const input = document.getElementById("qty") as HTMLInputElement | null;
+    if (input) input.value = state.form.qty;
+    updatePreview();
+  });
 }
 
 function focusQty() {
@@ -484,14 +520,15 @@ function optionTicketHTML(): string {
       <div class="opt-row"><span class="opt-k">Contract</span><span class="opt-v">${s.underlying.replace("-USD", "")} ${F.priceFmt(s.strike)} ${s.right.toUpperCase()}</span></div>
       <div class="opt-row"><span class="opt-k">Expiry</span><span class="opt-v num">${F.dayLabel(s.expiry)}</span></div>
       <div class="opt-row"><span class="opt-k">Bid / Ask</span><span class="opt-v num">${o.bid.toFixed(2)} / ${o.ask.toFixed(2)}</span></div>
-      <div class="opt-row"><span class="opt-k">Contract size</span><span class="opt-v num">×${s.multiplier}</span></div>
+      <div class="opt-row"><span class="opt-k">Contract size</span><span class="opt-v num">×${s.multiplier} ${s.underlying.replace("-USD", "")}</span></div>
     </div>
     <div class="seg ${state.form.side}" id="sideSeg">
       <button data-side="buy" class="${state.form.side === "buy" ? "on" : ""}">Buy to open</button>
       <button data-side="sell" class="${state.form.side === "sell" ? "on" : ""}">Sell to open</button>
     </div>
-    <div class="field"><label>Contracts</label>
-      <input class="input num" id="qty" inputmode="numeric" placeholder="1" value="${state.form.qty}"></div>
+    <div class="field"><label>Contracts (fractional allowed)</label>
+      <input class="input num" id="qty" inputmode="decimal" placeholder="0.1" value="${state.form.qty}"></div>
+    <div class="qty-chips" id="optChips"></div>
     <div class="preview" id="preview"></div>
     <button class="submit ${state.form.side}" id="submitBtn"></button>
     <div class="note" id="note"></div>
@@ -521,15 +558,25 @@ function updatePreview() {
     const o = state.form.option;
     const qty = parseFloat(state.form.qty) || 0;
     const px = state.form.side === "buy" ? o.ask : o.bid;
-    const cost = px * qty * o.spec.multiplier;
+    const perContract = px * o.spec.multiplier;
+    const cost = perContract * qty;
     const cash = W().portfolio.cash.toNumber();
+    const bp = W().buyingPower().toNumber();
+    const buying = state.form.side === "buy";
+    // How many contracts the account can actually afford (drives small-account practice).
+    const maxAffordable = perContract > 0 ? Math.floor((bp / perContract) * 100) / 100 : 0;
+    const overBudget = buying && cost > bp + 0.005;
+    renderOptChips(perContract, bp);
     preview.innerHTML = `
-      <div class="row"><span class="k">Est. ${state.form.side === "buy" ? "debit" : "credit"}</span><span class="num">${F.money(cost)}</span></div>
-      <div class="row"><span class="k">Price / contract</span><span class="num">${px.toFixed(2)} × ${o.spec.multiplier}</span></div>
-      <div class="row"><span class="k">Cash after</span><span class="num">${F.money(state.form.side === "buy" ? cash - cost : cash + cost)}</span></div>`;
+      <div class="row"><span class="k">Est. ${buying ? "debit" : "credit"}</span><span class="num ${overBudget ? "loss" : ""}">${F.money(cost)}</span></div>
+      <div class="row"><span class="k">Price / contract</span><span class="num">${px.toFixed(2)} × ${o.spec.multiplier} = ${F.money(perContract)}</span></div>
+      <div class="row"><span class="k">Max you can afford</span><span class="num">${maxAffordable > 0 ? maxAffordable.toFixed(2) : "0"}</span></div>
+      <div class="row"><span class="k">Cash after</span><span class="num ${buying && cash - cost < 0 ? "loss" : ""}">${F.money(buying ? cash - cost : cash + cost)}</span></div>`;
     btn.className = `submit ${state.form.side}`;
-    btn.textContent = `${state.form.side === "buy" ? "Buy" : "Sell"} ${qty || ""} ${qty === 1 ? "contract" : "contracts"}`.replace(/\s+/g, " ").trim();
-    btn.disabled = !qty;
+    btn.textContent = overBudget
+      ? "Insufficient buying power"
+      : `${buying ? "Buy" : "Sell"} ${qty ? F.qty(qty) : ""} ${qty === 1 ? "contract" : "contracts"}`.replace(/\s+/g, " ").trim();
+    btn.disabled = !qty || overBudget;
     return;
   }
 
@@ -573,8 +620,9 @@ function doSubmit() {
   note.textContent = "";
   state.form.qty = "";
   closeSheets();
-  if (W().mode === "live") toast("Order filled", "gain");
-  else toast(req.type === "market" ? "Order placed — fills next bar" : "Order working");
+  // Market orders fill instantly; resting orders (limit/stop/…) work until hit.
+  if (req.type === "market") toast(res.order?.status === "filled" ? "Order filled" : "Order placed", "gain");
+  else toast("Order working — fills when price is reached");
   refresh();
   if (state.screen === "book") renderBookScreen();
   if (state.screen === "options") renderOptionsScreen();
@@ -679,7 +727,7 @@ function closePosition(key: string) {
   if (!p) return;
   const side: Side = p.qty > 0 ? "sell" : "buy";
   store.submit({ target: p.target, side, qty: Math.abs(p.qty), type: "market", tif: "DAY" });
-  toast(W().mode === "live" ? "Position closed" : "Close order placed — fills next bar", "gain");
+  toast("Position closed", "gain");
   refresh();
 }
 

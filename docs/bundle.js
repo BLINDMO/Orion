@@ -369,13 +369,12 @@ var InstrumentData = class {
     return this.series["1m"] ?? this.series["1h"] ?? this.get("1d");
   }
   /**
-   * Canonical mark price at `now`: the close of the FRESHEST fully-closed bar
-   * across all available resolutions. Using the freshest (largest open-time) bar
-   * means marking stays correct even past the end of the fine-grained 1m window —
+   * The freshest fully-closed bar across all available resolutions at `now`
+   * (largest open-time wins). This is the single source of "the current price"
+   * and keeps marking correct even past the end of the fine-grained 1m window —
    * it transparently falls through to the hourly/daily series. Never looks ahead.
-   * Undefined if the clock predates all data.
    */
-  markPrice(now) {
+  freshestClosed(now) {
     let best;
     for (const res of ["1m", "1h", "1d"]) {
       const s = this.series[res];
@@ -383,7 +382,14 @@ var InstrumentData = class {
       const b = s.lastClosed(now);
       if (b && (best === void 0 || b.t > best.t)) best = b;
     }
-    return best?.c;
+    return best;
+  }
+  /**
+   * Canonical mark price at `now`: the close of the freshest fully-closed bar
+   * across all resolutions. Undefined if the clock predates all data.
+   */
+  markPrice(now) {
+    return this.freshestClosed(now)?.c;
   }
   /** Merge live candles into a resolution's series, creating it if absent. */
   appendLive(res, bars) {
@@ -1557,6 +1563,26 @@ var Market = class {
     px = side === "buy" ? Math.min(Math.max(px, bar.l), bar.h * 1.05) : Math.max(Math.min(px, bar.h), bar.l * 0.95);
     return { fillQty, price: dec(roundToTick(px, inst2.tickSize, side)) };
   }
+  /**
+   * Immediate ("at the touch") execution for a market order placed at `now`.
+   * References the CURRENT mark (the freshest closed bar's close — a price the
+   * trader can already see, so this is fully causal/no-lookahead) and applies
+   * half-spread plus size-based slippage. Unlike `executeAgainstBar` it never
+   * caps participation: the whole order fills now, just at a worse price for
+   * larger size. This is what makes a market order feel instant.
+   */
+  executeImmediate(symbol, side, qty2, refBar) {
+    const inst2 = this.instrument(symbol);
+    const micro = inst2.micro;
+    const realism = this.cfg.feeRealism;
+    const ref = refBar.c;
+    const halfSpread = realism ? micro.halfSpreadBps / 1e4 : 0;
+    const participation = realism && refBar.v > 0 ? Math.min(qty2 / refBar.v, 1) : 0;
+    const impact = realism ? micro.slippageK * participation / 1e4 : 0;
+    const sign2 = side === "buy" ? 1 : -1;
+    const px = ref * (1 + sign2 * (halfSpread + impact));
+    return { fillQty: qty2, price: dec(roundToTick(px, inst2.tickSize, side)) };
+  }
   /** Fee for a fill: bps of notional + per-order, with a minimum, by liquidity. */
   fee(symbol, notional, liquidity) {
     if (!this.cfg.feeRealism) return Dec.ZERO;
@@ -1859,8 +1885,8 @@ var World = class {
       triggered: req.type === "market" || req.type === "limit"
     };
     this.orders.set(order.id, order);
-    if (this.mode === "live" && req.type === "market") {
-      this.fillLiveMarket(order);
+    if (req.type === "market") {
+      this.fillMarketImmediate(order);
     }
     return { ok: true, order };
   }
@@ -2089,16 +2115,25 @@ var World = class {
     }
   }
   // --- Fill booking --------------------------------------------------------
-  fillLiveMarket(o) {
+  /**
+   * Fill a market order immediately at the current mark. Options fill at the
+   * synthesized ask/bid; spot fills against the freshest closed bar with
+   * spread + size slippage. If the instrument can't be priced yet (clock
+   * predates data) the order is left working and will fill on the next step.
+   */
+  fillMarketImmediate(o) {
     if (o.target.kind === "option" && o.target.option) {
       const q = this.market.optionQuote(o.target.option, this.now);
       if (!q) return;
-      this.bookOrderFill(o, o.qty, dec(o.side === "buy" ? q.ask : q.bid), "taker", this.now);
-    } else {
-      const ba = this.market.spotBidAsk(o.target.symbol, this.now);
-      if (!ba) return;
-      this.bookOrderFill(o, o.qty, o.side === "buy" ? ba.ask : ba.bid, "taker", this.now);
+      this.bookOrderFill(o, o.qty, dec(Math.max(0, o.side === "buy" ? q.ask : q.bid)), "taker", this.now);
+      return;
     }
+    const symbol = o.target.symbol;
+    const refBar = this.data.get(symbol)?.freshestClosed(this.now);
+    if (!refBar) return;
+    const exec = this.market.executeImmediate(symbol, o.side, this.remaining(o), refBar);
+    if (exec.fillQty <= 0) return;
+    this.bookOrderFill(o, exec.fillQty, exec.price, "taker", this.now);
   }
   bookOrderFill(o, qty2, price, liquidity, at) {
     const key = targetKey(o.target);
@@ -3746,11 +3781,13 @@ function visibleBars(s = sym()) {
   return all.length > CHART_MAX_BARS ? all.slice(all.length - CHART_MAX_BARS) : all.slice();
 }
 function lastAndChange(s) {
+  const markDec = W().market.spotMark(s, W().now);
   const bars = visibleBars(s);
-  if (!bars.length) return { last: null, chg: 0 };
-  const last = bars[bars.length - 1];
-  const prev = bars.length > 1 ? bars[bars.length - 2].c : last.o;
-  return { last: last.c, chg: prev ? (last.c - prev) / prev : 0 };
+  const fallback = bars.length ? bars[bars.length - 1].c : null;
+  const last = markDec ? markDec.toNumber() : fallback;
+  if (last === null || !bars.length) return { last, chg: 0 };
+  const prev = bars.length > 1 ? bars[bars.length - 2].c : bars[bars.length - 1].o;
+  return { last, chg: prev ? (last - prev) / prev : 0 };
 }
 function boot() {
   document.documentElement.setAttribute("data-theme", store.ui.theme);
@@ -4070,12 +4107,37 @@ function openOptionTicket(q) {
   state.form.option = { spec: q.spec, bid: q.bid, ask: q.ask, mid };
   state.form.side = "buy";
   state.form.type = "market";
-  state.form.qty = "1";
+  const perContract = q.ask * q.spec.multiplier;
+  const bp = W().buyingPower().toNumber();
+  let defaultQty = 1;
+  if (perContract > bp && perContract > 0) {
+    defaultQty = Math.max(0.01, Math.floor(bp / perContract * 100) / 100);
+  }
+  state.form.qty = String(defaultQty);
   const label = `${q.spec.underlying.replace("-USD", "")} ${priceFmt(q.spec.strike)}${q.spec.right[0].toUpperCase()}`;
   document.getElementById("ticketTitle").textContent = label;
   renderTicketBody();
   openSheet("ticketSheet");
   focusQty();
+}
+function renderOptChips(perContract, bp) {
+  const wrap = document.getElementById("optChips");
+  if (!wrap) return;
+  const max = perContract > 0 ? bp / perContract : 0;
+  const sizes = [
+    ["0.1", 0.1],
+    ["0.25", 0.25],
+    ["0.5", 0.5],
+    ["1", 1],
+    ["Max", Math.floor(max * 100) / 100]
+  ];
+  wrap.innerHTML = sizes.filter(([, v]) => v > 0 && v <= Math.max(1, max) + 1e-9).map(([label, v]) => `<button class="qty-chip" data-qty="${v}">${label}</button>`).join("");
+  wrap.querySelectorAll("[data-qty]").forEach((b) => b.onclick = () => {
+    state.form.qty = b.dataset.qty;
+    const input = document.getElementById("qty");
+    if (input) input.value = state.form.qty;
+    updatePreview();
+  });
 }
 function focusQty() {
   setTimeout(() => {
@@ -4130,14 +4192,15 @@ function optionTicketHTML() {
       <div class="opt-row"><span class="opt-k">Contract</span><span class="opt-v">${s.underlying.replace("-USD", "")} ${priceFmt(s.strike)} ${s.right.toUpperCase()}</span></div>
       <div class="opt-row"><span class="opt-k">Expiry</span><span class="opt-v num">${dayLabel(s.expiry)}</span></div>
       <div class="opt-row"><span class="opt-k">Bid / Ask</span><span class="opt-v num">${o.bid.toFixed(2)} / ${o.ask.toFixed(2)}</span></div>
-      <div class="opt-row"><span class="opt-k">Contract size</span><span class="opt-v num">\xD7${s.multiplier}</span></div>
+      <div class="opt-row"><span class="opt-k">Contract size</span><span class="opt-v num">\xD7${s.multiplier} ${s.underlying.replace("-USD", "")}</span></div>
     </div>
     <div class="seg ${state.form.side}" id="sideSeg">
       <button data-side="buy" class="${state.form.side === "buy" ? "on" : ""}">Buy to open</button>
       <button data-side="sell" class="${state.form.side === "sell" ? "on" : ""}">Sell to open</button>
     </div>
-    <div class="field"><label>Contracts</label>
-      <input class="input num" id="qty" inputmode="numeric" placeholder="1" value="${state.form.qty}"></div>
+    <div class="field"><label>Contracts (fractional allowed)</label>
+      <input class="input num" id="qty" inputmode="decimal" placeholder="0.1" value="${state.form.qty}"></div>
+    <div class="qty-chips" id="optChips"></div>
     <div class="preview" id="preview"></div>
     <button class="submit ${state.form.side}" id="submitBtn"></button>
     <div class="note" id="note"></div>
@@ -4170,15 +4233,22 @@ function updatePreview() {
     const o = state.form.option;
     const qty3 = parseFloat(state.form.qty) || 0;
     const px = state.form.side === "buy" ? o.ask : o.bid;
-    const cost = px * qty3 * o.spec.multiplier;
+    const perContract = px * o.spec.multiplier;
+    const cost = perContract * qty3;
     const cash2 = W().portfolio.cash.toNumber();
+    const bp = W().buyingPower().toNumber();
+    const buying = state.form.side === "buy";
+    const maxAffordable = perContract > 0 ? Math.floor(bp / perContract * 100) / 100 : 0;
+    const overBudget = buying && cost > bp + 5e-3;
+    renderOptChips(perContract, bp);
     preview.innerHTML = `
-      <div class="row"><span class="k">Est. ${state.form.side === "buy" ? "debit" : "credit"}</span><span class="num">${money(cost)}</span></div>
-      <div class="row"><span class="k">Price / contract</span><span class="num">${px.toFixed(2)} \xD7 ${o.spec.multiplier}</span></div>
-      <div class="row"><span class="k">Cash after</span><span class="num">${money(state.form.side === "buy" ? cash2 - cost : cash2 + cost)}</span></div>`;
+      <div class="row"><span class="k">Est. ${buying ? "debit" : "credit"}</span><span class="num ${overBudget ? "loss" : ""}">${money(cost)}</span></div>
+      <div class="row"><span class="k">Price / contract</span><span class="num">${px.toFixed(2)} \xD7 ${o.spec.multiplier} = ${money(perContract)}</span></div>
+      <div class="row"><span class="k">Max you can afford</span><span class="num">${maxAffordable > 0 ? maxAffordable.toFixed(2) : "0"}</span></div>
+      <div class="row"><span class="k">Cash after</span><span class="num ${buying && cash2 - cost < 0 ? "loss" : ""}">${money(buying ? cash2 - cost : cash2 + cost)}</span></div>`;
     btn.className = `submit ${state.form.side}`;
-    btn.textContent = `${state.form.side === "buy" ? "Buy" : "Sell"} ${qty3 || ""} ${qty3 === 1 ? "contract" : "contracts"}`.replace(/\s+/g, " ").trim();
-    btn.disabled = !qty3;
+    btn.textContent = overBudget ? "Insufficient buying power" : `${buying ? "Buy" : "Sell"} ${qty3 ? qty(qty3) : ""} ${qty3 === 1 ? "contract" : "contracts"}`.replace(/\s+/g, " ").trim();
+    btn.disabled = !qty3 || overBudget;
     return;
   }
   const mark = W().market.spotMark(sym(), W().now)?.toNumber();
@@ -4227,8 +4297,8 @@ function doSubmit() {
   note.textContent = "";
   state.form.qty = "";
   closeSheets();
-  if (W().mode === "live") toast("Order filled", "gain");
-  else toast(req.type === "market" ? "Order placed \u2014 fills next bar" : "Order working");
+  if (req.type === "market") toast(res.order?.status === "filled" ? "Order filled" : "Order placed", "gain");
+  else toast("Order working \u2014 fills when price is reached");
   refresh();
   if (state.screen === "book") renderBookScreen();
   if (state.screen === "options") renderOptionsScreen();
@@ -4317,7 +4387,7 @@ function closePosition(key) {
   if (!p) return;
   const side = p.qty > 0 ? "sell" : "buy";
   store.submit({ target: p.target, side, qty: Math.abs(p.qty), type: "market", tif: "DAY" });
-  toast(W().mode === "live" ? "Position closed" : "Close order placed \u2014 fills next bar", "gain");
+  toast("Position closed", "gain");
   refresh();
 }
 var warp = { on: false, raf: 0, lastTs: 0 };

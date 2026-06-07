@@ -222,9 +222,14 @@ export class World {
     };
     this.orders.set(order.id, order);
 
-    // In Live mode, market orders fill immediately against the current price.
-    if (this.mode === "live" && req.type === "market") {
-      this.fillLiveMarket(order);
+    // Market orders fill immediately at the current mark — in BOTH live and
+    // historical mode. A market order means "execute now at the price I can
+    // see"; forcing the trader to advance the clock to get a fill broke the
+    // practice loop and landed fills at a price they never saw. The mark is the
+    // freshest *closed* bar, so this stays causal (no look-ahead). Resting order
+    // types (limit/stop/…) still wait for price to trade through.
+    if (req.type === "market") {
+      this.fillMarketImmediate(order);
     }
     return { ok: true, order };
   }
@@ -495,16 +500,25 @@ export class World {
 
   // --- Fill booking --------------------------------------------------------
 
-  private fillLiveMarket(o: Order): void {
+  /**
+   * Fill a market order immediately at the current mark. Options fill at the
+   * synthesized ask/bid; spot fills against the freshest closed bar with
+   * spread + size slippage. If the instrument can't be priced yet (clock
+   * predates data) the order is left working and will fill on the next step.
+   */
+  private fillMarketImmediate(o: Order): void {
     if (o.target.kind === "option" && o.target.option) {
       const q = this.market.optionQuote(o.target.option, this.now);
       if (!q) return;
-      this.bookOrderFill(o, o.qty, dec(o.side === "buy" ? q.ask : q.bid), "taker", this.now);
-    } else {
-      const ba = this.market.spotBidAsk(o.target.symbol, this.now);
-      if (!ba) return;
-      this.bookOrderFill(o, o.qty, o.side === "buy" ? ba.ask : ba.bid, "taker", this.now);
+      this.bookOrderFill(o, o.qty, dec(Math.max(0, o.side === "buy" ? q.ask : q.bid)), "taker", this.now);
+      return;
     }
+    const symbol = o.target.symbol;
+    const refBar = this.data.get(symbol)?.freshestClosed(this.now);
+    if (!refBar) return; // no closed bar yet → leave working
+    const exec = this.market.executeImmediate(symbol, o.side, this.remaining(o), refBar);
+    if (exec.fillQty <= 0) return;
+    this.bookOrderFill(o, exec.fillQty, exec.price, "taker", this.now);
   }
 
   private bookOrderFill(o: Order, qty: number, price: Dec, liquidity: "maker" | "taker", at: Millis): void {

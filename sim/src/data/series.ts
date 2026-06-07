@@ -171,13 +171,12 @@ export class InstrumentData {
   }
 
   /**
-   * Canonical mark price at `now`: the close of the FRESHEST fully-closed bar
-   * across all available resolutions. Using the freshest (largest open-time) bar
-   * means marking stays correct even past the end of the fine-grained 1m window —
+   * The freshest fully-closed bar across all available resolutions at `now`
+   * (largest open-time wins). This is the single source of "the current price"
+   * and keeps marking correct even past the end of the fine-grained 1m window —
    * it transparently falls through to the hourly/daily series. Never looks ahead.
-   * Undefined if the clock predates all data.
    */
-  markPrice(now: Millis): number | undefined {
+  freshestClosed(now: Millis): Bar | undefined {
     let best: Bar | undefined;
     for (const res of ["1m", "1h", "1d"] as Resolution[]) {
       const s = this.series[res];
@@ -185,7 +184,15 @@ export class InstrumentData {
       const b = s.lastClosed(now);
       if (b && (best === undefined || b.t > best.t)) best = b;
     }
-    return best?.c;
+    return best;
+  }
+
+  /**
+   * Canonical mark price at `now`: the close of the freshest fully-closed bar
+   * across all resolutions. Undefined if the clock predates all data.
+   */
+  markPrice(now: Millis): number | undefined {
+    return this.freshestClosed(now)?.c;
   }
 
   /** Merge live candles into a resolution's series, creating it if absent. */

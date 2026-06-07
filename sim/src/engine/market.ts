@@ -119,6 +119,28 @@ export class Market {
     return { fillQty, price: dec(roundToTick(px, inst.tickSize, side)) };
   }
 
+  /**
+   * Immediate ("at the touch") execution for a market order placed at `now`.
+   * References the CURRENT mark (the freshest closed bar's close — a price the
+   * trader can already see, so this is fully causal/no-lookahead) and applies
+   * half-spread plus size-based slippage. Unlike `executeAgainstBar` it never
+   * caps participation: the whole order fills now, just at a worse price for
+   * larger size. This is what makes a market order feel instant.
+   */
+  executeImmediate(symbol: string, side: Side, qty: number, refBar: Bar): ExecResult {
+    const inst = this.instrument(symbol);
+    const micro = inst.micro;
+    const realism = this.cfg.feeRealism;
+    const ref = refBar.c; // current mark
+    const halfSpread = realism ? micro.halfSpreadBps / 10000 : 0;
+    // Size impact: how much of the recent bar's volume this order represents.
+    const participation = realism && refBar.v > 0 ? Math.min(qty / refBar.v, 1) : 0;
+    const impact = realism ? (micro.slippageK * participation) / 10000 : 0;
+    const sign = side === "buy" ? 1 : -1;
+    const px = ref * (1 + sign * (halfSpread + impact));
+    return { fillQty: qty, price: dec(roundToTick(px, inst.tickSize, side)) };
+  }
+
   /** Fee for a fill: bps of notional + per-order, with a minimum, by liquidity. */
   fee(symbol: string, notional: Dec, liquidity: "maker" | "taker"): Dec {
     if (!this.cfg.feeRealism) return Dec.ZERO;

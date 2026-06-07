@@ -373,6 +373,17 @@ select.input { font-family: var(--font); font-size: 13px; cursor: pointer; }
 .preview { margin-top: 13px; padding: 11px 13px; background: var(--surface); border: 1px solid var(--hairline); border-radius: var(--r-md); font-size: 12px; }
 .preview .row { display: flex; justify-content: space-between; padding: 4px 0; }
 .preview .row .k { color: var(--text-2); }
+
+/* Quick-size chips (option ticket) */
+.qty-chips { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.qty-chip {
+  flex: 1; min-width: 44px; padding: 7px 0; border-radius: var(--r);
+  border: 1px solid var(--hairline); background: var(--surface);
+  color: var(--text-2); font-size: 12px; font-weight: 600; text-align: center;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.qty-chip:hover { color: var(--accent); border-color: var(--accent-border); background: var(--accent-subtle); }
+.qty-chip:active { transform: scale(0.96); }
 .submit {
   width: 100%; margin-top: 15px; padding: 14px;
   border-radius: var(--r-md); font-weight: 700; font-size: 14px;

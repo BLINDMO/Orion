@@ -20,18 +20,20 @@ function makeWorld(overrides = {}) {
   });
 }
 
-test("market order fills on the next bar (no look-ahead) and updates cash", () => {
+test("market order fills immediately at the current mark and updates cash", () => {
   const w = makeWorld();
   const before = w.portfolio.cash.toNumber();
   const res = w.submit({ target: { kind: "spot", symbol: "BTC-USD" }, side: "buy", qty: 0.5, type: "market" });
   assert.equal(res.ok, true);
-  // not filled until time advances
-  assert.equal(w.fills.length, 0);
-  w.advanceHour();
+  // a market order executes now — no need to advance the clock
   assert.equal(w.fills.length, 1);
+  assert.equal(res.order!.status, "filled");
   const pos = w.portfolio.get("BTC-USD")!;
   assert.equal(pos.qty, 0.5);
   assert.ok(w.portfolio.cash.toNumber() < before, "cash decreased");
+  // fill price is near the current mark (within spread/slippage), never look-ahead
+  const mark = w.market.spotMark("BTC-USD", w.now)!.toNumber();
+  assert.ok(Math.abs(res.order!.avgFillPrice.toNumber() - mark) / mark < 0.02, "fills at the visible mark");
 });
 
 test("chart ⇆ portfolio parity: mark equals the chart's last close (§13.3)", () => {
@@ -77,15 +79,13 @@ test("buying power blocks opening beyond margin, allows closing", () => {
 
 test("short sell increases cash and marks negative; covering realizes", () => {
   const w = makeWorld();
-  w.submit({ target: { kind: "spot", symbol: "SOL-USD" }, side: "sell", qty: 100, type: "market" });
   const cash0 = w.portfolio.cash.toNumber();
-  w.advanceHour();
+  w.submit({ target: { kind: "spot", symbol: "SOL-USD" }, side: "sell", qty: 100, type: "market" });
   const pos = w.portfolio.get("SOL-USD")!;
   assert.ok(pos.qty < 0, "short position");
   assert.ok(w.portfolio.cash.toNumber() > cash0, "received proceeds");
   // cover
   w.submit({ target: { kind: "spot", symbol: "SOL-USD" }, side: "buy", qty: 100, type: "market" });
-  w.advanceHour();
   assert.equal(w.portfolio.get("SOL-USD"), undefined);
 });
 
